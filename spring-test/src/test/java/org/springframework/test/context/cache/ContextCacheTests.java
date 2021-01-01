@@ -1,11 +1,11 @@
 /*
- * Copyright 2002-2015 the original author or authors.
+ * Copyright 2002-2019 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,8 +16,8 @@
 
 package org.springframework.test.context.cache;
 
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Configuration;
@@ -32,8 +32,8 @@ import org.springframework.test.context.TestContextTestUtils;
 import org.springframework.test.context.support.AnnotationConfigContextLoader;
 import org.springframework.test.util.ReflectionTestUtils;
 
-import static org.junit.Assert.*;
-import static org.springframework.test.context.cache.ContextCacheTestUtils.*;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.context.cache.ContextCacheTestUtils.assertContextCacheStatistics;
 
 /**
  * Integration tests for verifying proper behavior of the {@link ContextCache} in
@@ -42,21 +42,22 @@ import static org.springframework.test.context.cache.ContextCacheTestUtils.*;
  * @author Sam Brannen
  * @author Michail Nikolaev
  * @since 3.1
- * @see SpringRunnerContextCacheTests
+ * @see LruContextCacheTests
+ * @see SpringExtensionContextCacheTests
  */
-public class ContextCacheTests {
+class ContextCacheTests {
 
 	private ContextCache contextCache = new DefaultContextCache();
 
 
-	@Before
-	public void initialCacheState() {
+	@BeforeEach
+	void initialCacheState() {
 		assertContextCacheStatistics(contextCache, "initial state", 0, 0, 0);
 		assertParentContextCount(0);
 	}
 
 	private void assertParentContextCount(int expected) {
-		assertEquals("parent context count", expected, contextCache.getParentContextCount());
+		assertThat(contextCache.getParentContextCount()).as("parent context count").isEqualTo(expected);
 	}
 
 	private MergedContextConfiguration getMergedContextConfiguration(TestContext testContext) {
@@ -69,13 +70,13 @@ public class ContextCacheTests {
 	}
 
 	private void loadCtxAndAssertStats(Class<?> testClass, int expectedSize, int expectedHitCount, int expectedMissCount) {
-		assertNotNull(loadContext(testClass));
+		assertThat(loadContext(testClass)).isNotNull();
 		assertContextCacheStatistics(contextCache, testClass.getName(), expectedSize, expectedHitCount,
 			expectedMissCount);
 	}
 
 	@Test
-	public void verifyCacheKeyIsBasedOnContextLoader() {
+	void verifyCacheKeyIsBasedOnContextLoader() {
 		loadCtxAndAssertStats(AnnotationConfigContextLoaderTestCase.class, 1, 0, 1);
 		loadCtxAndAssertStats(AnnotationConfigContextLoaderTestCase.class, 1, 1, 1);
 		loadCtxAndAssertStats(CustomAnnotationConfigContextLoaderTestCase.class, 2, 1, 2);
@@ -85,19 +86,20 @@ public class ContextCacheTests {
 	}
 
 	@Test
-	public void verifyCacheKeyIsBasedOnActiveProfiles() {
-		loadCtxAndAssertStats(FooBarProfilesTestCase.class, 1, 0, 1);
-		loadCtxAndAssertStats(FooBarProfilesTestCase.class, 1, 1, 1);
-		// Profiles {foo, bar} should hash to the same as {bar,foo}
-		loadCtxAndAssertStats(BarFooProfilesTestCase.class, 1, 2, 1);
-		loadCtxAndAssertStats(FooBarProfilesTestCase.class, 1, 3, 1);
-		loadCtxAndAssertStats(FooBarProfilesTestCase.class, 1, 4, 1);
-		loadCtxAndAssertStats(BarFooProfilesTestCase.class, 1, 5, 1);
-		loadCtxAndAssertStats(FooBarActiveProfilesResolverTestCase.class, 1, 6, 1);
+	void verifyCacheKeyIsBasedOnActiveProfiles() {
+		int size = 0, hit = 0, miss = 0;
+		loadCtxAndAssertStats(FooBarProfilesTestCase.class, ++size, hit, ++miss);
+		loadCtxAndAssertStats(FooBarProfilesTestCase.class, size, ++hit, miss);
+		// Profiles {foo, bar} should not hash to the same as {bar,foo}
+		loadCtxAndAssertStats(BarFooProfilesTestCase.class, ++size, hit, ++miss);
+		loadCtxAndAssertStats(FooBarProfilesTestCase.class, size, ++hit, miss);
+		loadCtxAndAssertStats(FooBarProfilesTestCase.class, size, ++hit, miss);
+		loadCtxAndAssertStats(BarFooProfilesTestCase.class, size, ++hit, miss);
+		loadCtxAndAssertStats(FooBarActiveProfilesResolverTestCase.class, size, ++hit, miss);
 	}
 
 	@Test
-	public void verifyCacheBehaviorForContextHierarchies() {
+	void verifyCacheBehaviorForContextHierarchies() {
 		int size = 0;
 		int hits = 0;
 		int misses = 0;
@@ -124,7 +126,7 @@ public class ContextCacheTests {
 	}
 
 	@Test
-	public void removeContextHierarchyCacheLevel1() {
+	void removeContextHierarchyCacheLevel1() {
 
 		// Load Level 3-A
 		TestContext testContext3a = TestContextTestUtils.buildTestContext(
@@ -149,7 +151,7 @@ public class ContextCacheTests {
 	}
 
 	@Test
-	public void removeContextHierarchyCacheLevel1WithExhaustiveMode() {
+	void removeContextHierarchyCacheLevel1WithExhaustiveMode() {
 
 		// Load Level 3-A
 		TestContext testContext3a = TestContextTestUtils.buildTestContext(
@@ -174,7 +176,7 @@ public class ContextCacheTests {
 	}
 
 	@Test
-	public void removeContextHierarchyCacheLevel2() {
+	void removeContextHierarchyCacheLevel2() {
 
 		// Load Level 3-A
 		TestContext testContext3a = TestContextTestUtils.buildTestContext(
@@ -200,7 +202,7 @@ public class ContextCacheTests {
 	}
 
 	@Test
-	public void removeContextHierarchyCacheLevel2WithExhaustiveMode() {
+	void removeContextHierarchyCacheLevel2WithExhaustiveMode() {
 
 		// Load Level 3-A
 		TestContext testContext3a = TestContextTestUtils.buildTestContext(
@@ -224,7 +226,7 @@ public class ContextCacheTests {
 	}
 
 	@Test
-	public void removeContextHierarchyCacheLevel3Then2() {
+	void removeContextHierarchyCacheLevel3Then2() {
 
 		// Load Level 3-A
 		TestContext testContext3a = TestContextTestUtils.buildTestContext(
@@ -253,7 +255,7 @@ public class ContextCacheTests {
 	}
 
 	@Test
-	public void removeContextHierarchyCacheLevel3Then2WithExhaustiveMode() {
+	void removeContextHierarchyCacheLevel3Then2WithExhaustiveMode() {
 
 		// Load Level 3-A
 		TestContext testContext3a = TestContextTestUtils.buildTestContext(

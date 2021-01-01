@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE beans PUBLIC "-//SPRING//DTD BEAN 2.0//EN" "http://www.springframework.org/dtd/spring-beans-2.0.dtd">
+<!DOCTYPE beans PUBLIC "-//SPRING//DTD BEAN 2.0//EN" "https://www.springframework.org/dtd/spring-beans-2.0.dtd">
 
 <beans>
 
@@ -14,11 +14,11 @@ import org.springframework.scripting.Messenger
 class DelegatingMessenger implements Messenger {
 
 	private Messenger wrappedMessenger;
-	
+
 	public String getMessage() {
 		this.wrappedMessenger.getMessage();
 	}
-	
+
 	public void setMessenger(Messenger wrappedMessenger) {
 		this.wrappedMessenger = wrappedMessenger;
 	}
@@ -26,7 +26,7 @@ class DelegatingMessenger implements Messenger {
 		</constructor-arg>
 		<property name="messenger" ref="wrappedMessenger"/>
 	</bean>
-	
+
 	<bean id="wrappedMessenger" class="org.springframework.scripting.support.StubMessenger"/>
 
 </beans>

@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -41,6 +41,7 @@ public class ScriptStatementFailedException extends ScriptException {
 		super(buildErrorMessage(stmt, stmtNumber, encodedResource), cause);
 	}
 
+
 	/**
 	 * Build an error message for an SQL script execution failure,
 	 * based on the supplied arguments.
@@ -53,8 +54,7 @@ public class ScriptStatementFailedException extends ScriptException {
 	 * @since 4.2
 	 */
 	public static String buildErrorMessage(String stmt, int stmtNumber, EncodedResource encodedResource) {
-		return String.format("Failed to execute SQL script statement #%s of %s: %s",
-				stmtNumber, encodedResource, stmt);
+		return String.format("Failed to execute SQL script statement #%s of %s: %s", stmtNumber, encodedResource, stmt);
 	}
 
 }

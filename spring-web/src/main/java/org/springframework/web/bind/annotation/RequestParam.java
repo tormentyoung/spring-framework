@@ -1,11 +1,11 @@
 /*
- * Copyright 2002-2015 the original author or authors.
+ * Copyright 2002-2018 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,7 +29,17 @@ import org.springframework.core.annotation.AliasFor;
  * Annotation which indicates that a method parameter should be bound to a web
  * request parameter.
  *
- * <p>Supported for annotated handler methods in Servlet and Portlet environments.
+ * <p>Supported for annotated handler methods in Spring MVC and Spring WebFlux
+ * as follows:
+ * <ul>
+ * <li>In Spring MVC, "request parameters" map to query parameters, form data,
+ * and parts in multipart requests. This is because the Servlet API combines
+ * query parameters and form data into a single map called "parameters", and
+ * that includes automatic parsing of the request body.
+ * <li>In Spring WebFlux, "request parameters" map to query parameters only.
+ * To work with all 3, query, form data, and multipart data, you can use data
+ * binding to a command object annotated with {@link ModelAttribute}.
+ * </ul>
  *
  * <p>If the method parameter type is {@link Map} and a request parameter name
  * is specified, then the request parameter value is converted to a {@link Map}
@@ -47,9 +57,6 @@ import org.springframework.core.annotation.AliasFor;
  * @see RequestMapping
  * @see RequestHeader
  * @see CookieValue
- * @see org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter
- * @see org.springframework.web.servlet.mvc.annotation.AnnotationMethodHandlerAdapter
- * @see org.springframework.web.portlet.mvc.annotation.AnnotationMethodHandlerAdapter
  */
 @Target(ElementType.PARAMETER)
 @Retention(RetentionPolicy.RUNTIME)
@@ -59,30 +66,32 @@ public @interface RequestParam {
 	/**
 	 * Alias for {@link #name}.
 	 */
-	@AliasFor(attribute = "name")
+	@AliasFor("name")
 	String value() default "";
 
 	/**
 	 * The name of the request parameter to bind to.
 	 * @since 4.2
 	 */
-	@AliasFor(attribute = "value")
+	@AliasFor("value")
 	String name() default "";
 
 	/**
 	 * Whether the parameter is required.
-	 * <p>Default is {@code true}, leading to an exception thrown in case
-	 * of the parameter missing in the request. Switch this to {@code false}
-	 * if you prefer a {@code null} in case of the parameter missing.
-	 * <p>Alternatively, provide a {@link #defaultValue() defaultValue},
-	 * which implicitly sets this flag to {@code false}.
+	 * <p>Defaults to {@code true}, leading to an exception being thrown
+	 * if the parameter is missing in the request. Switch this to
+	 * {@code false} if you prefer a {@code null} value if the parameter is
+	 * not present in the request.
+	 * <p>Alternatively, provide a {@link #defaultValue}, which implicitly
+	 * sets this flag to {@code false}.
 	 */
 	boolean required() default true;
 
 	/**
-	 * The default value to use as a fallback when the request parameter value
-	 * is not provided or empty. Supplying a default value implicitly sets
-	 * {@link #required()} to false.
+	 * The default value to use as a fallback when the request parameter is
+	 * not provided or has an empty value.
+	 * <p>Supplying a default value implicitly sets {@link #required} to
+	 * {@code false}.
 	 */
 	String defaultValue() default ValueConstants.DEFAULT_NONE;
 

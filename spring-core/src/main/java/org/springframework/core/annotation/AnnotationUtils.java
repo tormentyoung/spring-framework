@@ -1,11 +1,11 @@
 /*
- * Copyright 2002-2015 the original author or authors.
+ * Copyright 2002-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,27 +19,23 @@ package org.springframework.core.annotation;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.AnnotatedElement;
 import java.lang.reflect.Array;
-import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
-import java.util.ArrayList;
+import java.lang.reflect.Modifier;
+import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Set;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-
 import org.springframework.core.BridgeMethodResolver;
-import org.springframework.util.Assert;
-import org.springframework.util.ClassUtils;
+import org.springframework.core.annotation.AnnotationTypeMapping.MirrorSets.MirrorSet;
+import org.springframework.core.annotation.MergedAnnotation.Adapt;
+import org.springframework.core.annotation.MergedAnnotations.SearchStrategy;
+import org.springframework.lang.Nullable;
+import org.springframework.util.CollectionUtils;
 import org.springframework.util.ConcurrentReferenceHashMap;
-import org.springframework.util.ObjectUtils;
 import org.springframework.util.ReflectionUtils;
 import org.springframework.util.StringUtils;
 
@@ -51,29 +47,38 @@ import org.springframework.util.StringUtils;
  * <p>Note that most of the features of this class are not provided by the
  * JDK's introspection facilities themselves.
  *
- * <p>As a general rule for runtime-retained annotations (e.g. for transaction
- * control, authorization, or service exposure), always use the lookup methods
- * on this class (e.g., {@link #findAnnotation(Method, Class)},
- * {@link #getAnnotation(Method, Class)}, and {@link #getAnnotations(Method)})
- * instead of the plain annotation lookup methods in the JDK. You can still
- * explicitly choose between a <em>get</em> lookup on the given class level only
- * ({@link #getAnnotation(Method, Class)}) and a <em>find</em> lookup in the entire
- * inheritance hierarchy of the given method ({@link #findAnnotation(Method, Class)}).
+ * <p>As a general rule for runtime-retained application annotations (e.g. for
+ * transaction control, authorization, or service exposure), always use the
+ * lookup methods on this class (e.g. {@link #findAnnotation(Method, Class)} or
+ * {@link #getAnnotation(Method, Class)}) instead of the plain annotation lookup
+ * methods in the JDK. You can still explicitly choose between a <em>get</em>
+ * lookup on the given class level only ({@link #getAnnotation(Method, Class)})
+ * and a <em>find</em> lookup in the entire inheritance hierarchy of the given
+ * method ({@link #findAnnotation(Method, Class)}).
  *
  * <h3>Terminology</h3>
- * The terms <em>directly present</em> and <em>present</em> have the same
- * meanings as defined in the class-level Javadoc for {@link AnnotatedElement}.
+ * The terms <em>directly present</em>, <em>indirectly present</em>, and
+ * <em>present</em> have the same meanings as defined in the class-level
+ * javadoc for {@link AnnotatedElement} (in Java 8).
  *
  * <p>An annotation is <em>meta-present</em> on an element if the annotation
  * is declared as a meta-annotation on some other annotation which is
- * <em>present</em> on the element.
+ * <em>present</em> on the element. Annotation {@code A} is <em>meta-present</em>
+ * on another annotation if {@code A} is either <em>directly present</em> or
+ * <em>meta-present</em> on the other annotation.
  *
  * <h3>Meta-annotation Support</h3>
- * <p>Most {@code find*()} methods and some {@code get*()} methods in this
- * class provide support for finding annotations used as meta-annotations.
- * Consult the Javadoc for each method in this class for details. For support
- * for meta-annotations with <em>attribute overrides</em> in
- * <em>composed annotations</em>, use {@link AnnotatedElementUtils} instead.
+ * <p>Most {@code find*()} methods and some {@code get*()} methods in this class
+ * provide support for finding annotations used as meta-annotations. Consult the
+ * javadoc for each method in this class for details. For fine-grained support for
+ * meta-annotations with <em>attribute overrides</em> in <em>composed annotations</em>,
+ * consider using {@link AnnotatedElementUtils}'s more specific methods instead.
+ *
+ * <h3>Attribute Aliases</h3>
+ * <p>All public methods in this class that return annotations, arrays of
+ * annotations, or {@link AnnotationAttributes} transparently support attribute
+ * aliases configured via {@link AliasFor @AliasFor}. Consult the various
+ * {@code synthesizeAnnotation*(..)} methods for details.
  *
  * <h3>Search Scope</h3>
  * <p>The search algorithms used by methods in this class stop searching for
@@ -87,6 +92,7 @@ import org.springframework.util.StringUtils;
  * @author Mark Fisher
  * @author Chris Beams
  * @author Phillip Webb
+ * @author Oleg Zhurakousky
  * @since 2.0
  * @see AliasFor
  * @see AnnotationAttributes
@@ -101,32 +107,71 @@ public abstract class AnnotationUtils {
 	/**
 	 * The attribute name for annotations with a single element.
 	 */
-	public static final String VALUE = "value";
+	public static final String VALUE = MergedAnnotation.VALUE;
+
+	private static final AnnotationFilter JAVA_LANG_ANNOTATION_FILTER =
+			AnnotationFilter.packages("java.lang.annotation");
+
+	private static final Map<Class<? extends Annotation>, Map<String, DefaultValueHolder>> defaultValuesCache =
+			new ConcurrentReferenceHashMap<>();
 
 
 	/**
-	 * An object that can be stored in {@link AnnotationAttributes} as a
-	 * placeholder for an attribute's declared default value.
+	 * Determine whether the given class is a candidate for carrying one of the specified
+	 * annotations (at type, method or field level).
+	 * @param clazz the class to introspect
+	 * @param annotationTypes the searchable annotation types
+	 * @return {@code false} if the class is known to have no such annotations at any level;
+	 * {@code true} otherwise. Callers will usually perform full method/field introspection
+	 * if {@code true} is being returned here.
+	 * @since 5.2
+	 * @see #isCandidateClass(Class, Class)
+	 * @see #isCandidateClass(Class, String)
 	 */
-	private static final Object DEFAULT_VALUE_PLACEHOLDER = new String("<SPRING DEFAULT VALUE PLACEHOLDER>");
+	public static boolean isCandidateClass(Class<?> clazz, Collection<Class<? extends Annotation>> annotationTypes) {
+		for (Class<? extends Annotation> annotationType : annotationTypes) {
+			if (isCandidateClass(clazz, annotationType)) {
+				return true;
+			}
+		}
+		return false;
+	}
 
-	private static final Map<AnnotationCacheKey, Annotation> findAnnotationCache =
-			new ConcurrentReferenceHashMap<AnnotationCacheKey, Annotation>(256);
+	/**
+	 * Determine whether the given class is a candidate for carrying the specified annotation
+	 * (at type, method or field level).
+	 * @param clazz the class to introspect
+	 * @param annotationType the searchable annotation type
+	 * @return {@code false} if the class is known to have no such annotations at any level;
+	 * {@code true} otherwise. Callers will usually perform full method/field introspection
+	 * if {@code true} is being returned here.
+	 * @since 5.2
+	 * @see #isCandidateClass(Class, String)
+	 */
+	public static boolean isCandidateClass(Class<?> clazz, Class<? extends Annotation> annotationType) {
+		return isCandidateClass(clazz, annotationType.getName());
+	}
 
-	private static final Map<Class<?>, Boolean> annotatedInterfaceCache =
-			new ConcurrentReferenceHashMap<Class<?>, Boolean>(256);
-
-	private static final Map<Class<? extends Annotation>, Boolean> synthesizableCache =
-			new ConcurrentReferenceHashMap<Class<? extends Annotation>, Boolean>(256);
-
-	private static final Map<Class<? extends Annotation>, Map<String, String>> attributeAliasesCache =
-			new ConcurrentReferenceHashMap<Class<? extends Annotation>, Map<String, String>>(256);
-
-	private static final Map<Class<? extends Annotation>, List<Method>> attributeMethodsCache =
-			new ConcurrentReferenceHashMap<Class<? extends Annotation>, List<Method>>(256);
-
-	private static transient Log logger;
-
+	/**
+	 * Determine whether the given class is a candidate for carrying the specified annotation
+	 * (at type, method or field level).
+	 * @param clazz the class to introspect
+	 * @param annotationName the fully-qualified name of the searchable annotation type
+	 * @return {@code false} if the class is known to have no such annotations at any level;
+	 * {@code true} otherwise. Callers will usually perform full method/field introspection
+	 * if {@code true} is being returned here.
+	 * @since 5.2
+	 * @see #isCandidateClass(Class, Class)
+	 */
+	public static boolean isCandidateClass(Class<?> clazz, String annotationName) {
+		if (annotationName.startsWith("java.")) {
+			return true;
+		}
+		if (AnnotationsScanner.hasPlainJavaAnnotationsOnly(clazz)) {
+			return false;
+		}
+		return true;
+	}
 
 	/**
 	 * Get a single {@link Annotation} of {@code annotationType} from the supplied
@@ -135,25 +180,26 @@ public abstract class AnnotationUtils {
 	 * <p>Note that this method supports only a single level of meta-annotations.
 	 * For support for arbitrary levels of meta-annotations, use one of the
 	 * {@code find*()} methods instead.
-	 * @param ann the Annotation to check
+	 * @param annotation the Annotation to check
 	 * @param annotationType the annotation type to look for, both locally and as a meta-annotation
 	 * @return the first matching annotation, or {@code null} if not found
 	 * @since 4.0
 	 */
 	@SuppressWarnings("unchecked")
-	public static <A extends Annotation> A getAnnotation(Annotation ann, Class<A> annotationType) {
-		if (annotationType.isInstance(ann)) {
-			return synthesizeAnnotation((A) ann);
+	@Nullable
+	public static <A extends Annotation> A getAnnotation(Annotation annotation, Class<A> annotationType) {
+		// Shortcut: directly present on the element, with no merging needed?
+		if (annotationType.isInstance(annotation)) {
+			return synthesizeAnnotation((A) annotation, annotationType);
 		}
-		Class<? extends Annotation> annotatedElement = ann.annotationType();
-		try {
-			return synthesizeAnnotation(annotatedElement.getAnnotation(annotationType), annotatedElement);
-		}
-		catch (Exception ex) {
-			// Assuming nested Class values not resolvable within annotation attributes...
-			handleIntrospectionFailure(annotatedElement, ex);
+		// Shortcut: no searchable annotations to be found on plain Java classes and core Spring types...
+		if (AnnotationsScanner.hasPlainJavaAnnotationsOnly(annotation)) {
 			return null;
 		}
+		// Exhaustive retrieval of merged annotations...
+		return MergedAnnotations.from(annotation, new Annotation[] {annotation}, RepeatableContainers.none())
+				.get(annotationType).withNonMergedAttributes()
+				.synthesize(AnnotationUtils::isSingleLevelPresent).orElse(null);
 	}
 
 	/**
@@ -168,24 +214,22 @@ public abstract class AnnotationUtils {
 	 * @return the first matching annotation, or {@code null} if not found
 	 * @since 3.1
 	 */
+	@Nullable
 	public static <A extends Annotation> A getAnnotation(AnnotatedElement annotatedElement, Class<A> annotationType) {
-		try {
-			A annotation = annotatedElement.getAnnotation(annotationType);
-			if (annotation == null) {
-				for (Annotation metaAnn : annotatedElement.getAnnotations()) {
-					annotation = metaAnn.annotationType().getAnnotation(annotationType);
-					if (annotation != null) {
-						break;
-					}
-				}
-			}
-			return synthesizeAnnotation(annotation, annotatedElement);
+		// Shortcut: directly present on the element, with no merging needed?
+		if (AnnotationFilter.PLAIN.matches(annotationType) ||
+				AnnotationsScanner.hasPlainJavaAnnotationsOnly(annotatedElement)) {
+			return annotatedElement.getAnnotation(annotationType);
 		}
-		catch (Exception ex) {
-			// Assuming nested Class values not resolvable within annotation attributes...
-			handleIntrospectionFailure(annotatedElement, ex);
-			return null;
-		}
+		// Exhaustive retrieval of merged annotations...
+		return MergedAnnotations.from(annotatedElement, SearchStrategy.INHERITED_ANNOTATIONS, RepeatableContainers.none())
+				.get(annotationType).withNonMergedAttributes()
+				.synthesize(AnnotationUtils::isSingleLevelPresent).orElse(null);
+	}
+
+	private static <A extends Annotation> boolean isSingleLevelPresent(MergedAnnotation<A> mergedAnnotation) {
+		int distance = mergedAnnotation.getDistance();
+		return (distance == 0 || distance == 1);
 	}
 
 	/**
@@ -202,6 +246,7 @@ public abstract class AnnotationUtils {
 	 * @see org.springframework.core.BridgeMethodResolver#findBridgedMethod(Method)
 	 * @see #getAnnotation(AnnotatedElement, Class)
 	 */
+	@Nullable
 	public static <A extends Annotation> A getAnnotation(Method method, Class<A> annotationType) {
 		Method resolvedMethod = BridgeMethodResolver.findBridgedMethod(method);
 		return getAnnotation((AnnotatedElement) resolvedMethod, annotationType);
@@ -216,20 +261,23 @@ public abstract class AnnotationUtils {
 	 * resolvable (e.g. because nested Class values in annotation attributes
 	 * failed to resolve at runtime)
 	 * @since 4.0.8
+	 * @see AnnotatedElement#getAnnotations()
+	 * @deprecated as of 5.2 since it is superseded by the {@link MergedAnnotations} API
 	 */
+	@Deprecated
+	@Nullable
 	public static Annotation[] getAnnotations(AnnotatedElement annotatedElement) {
 		try {
-			return annotatedElement.getAnnotations();
+			return synthesizeAnnotationArray(annotatedElement.getAnnotations(), annotatedElement);
 		}
-		catch (Exception ex) {
-			// Assuming nested Class values not resolvable within annotation attributes...
+		catch (Throwable ex) {
 			handleIntrospectionFailure(annotatedElement, ex);
+			return null;
 		}
-		return null;
 	}
 
 	/**
-	 * Get all {@link Annotation Annotations} that are <em>present</em on the
+	 * Get all {@link Annotation Annotations} that are <em>present</em> on the
 	 * supplied {@link Method}.
 	 * <p>Correctly handles bridge {@link Method Methods} generated by the compiler.
 	 * <p>Meta-annotations will <em>not</em> be searched.
@@ -239,72 +287,180 @@ public abstract class AnnotationUtils {
 	 * failed to resolve at runtime)
 	 * @see org.springframework.core.BridgeMethodResolver#findBridgedMethod(Method)
 	 * @see AnnotatedElement#getAnnotations()
+	 * @deprecated as of 5.2 since it is superseded by the {@link MergedAnnotations} API
 	 */
+	@Deprecated
+	@Nullable
 	public static Annotation[] getAnnotations(Method method) {
 		try {
-			return BridgeMethodResolver.findBridgedMethod(method).getAnnotations();
+			return synthesizeAnnotationArray(BridgeMethodResolver.findBridgedMethod(method).getAnnotations(), method);
 		}
-		catch (Exception ex) {
-			// Assuming nested Class values not resolvable within annotation attributes...
+		catch (Throwable ex) {
 			handleIntrospectionFailure(method, ex);
+			return null;
 		}
-		return null;
 	}
 
 	/**
-	 * Get the <em>repeatable</em> {@link Annotation}s of {@code annotationType}
-	 * from the supplied {@link Method}, where such annotations are either
-	 * <em>present</em> or <em>meta-present</em> on the method.
+	 * Get the <em>repeatable</em> {@linkplain Annotation annotations} of
+	 * {@code annotationType} from the supplied {@link AnnotatedElement}, where
+	 * such annotations are either <em>present</em>, <em>indirectly present</em>,
+	 * or <em>meta-present</em> on the element.
+	 * <p>This method mimics the functionality of Java 8's
+	 * {@link java.lang.reflect.AnnotatedElement#getAnnotationsByType(Class)}
+	 * with support for automatic detection of a <em>container annotation</em>
+	 * declared via @{@link java.lang.annotation.Repeatable} (when running on
+	 * Java 8 or higher) and with additional support for meta-annotations.
 	 * <p>Handles both single annotations and annotations nested within a
-	 * <em>containing annotation</em>.
-	 * <p>Correctly handles bridge {@link Method Methods} generated by the compiler.
-	 * <p>Meta-annotations will be searched if the annotation is not
-	 * <em>present</em> on the supplied method.
-	 * @param method the method to look for annotations on; never {@code null}
-	 * @param containerAnnotationType the type of the container that holds the
-	 * annotations; may be {@code null} if a container is not supported
-	 * @param annotationType the annotation type to look for
-	 * @return the annotations found or an empty set; never {@code null}
-	 * @since 4.0
-	 * @see org.springframework.core.BridgeMethodResolver#findBridgedMethod(Method)
-	 * @see java.lang.annotation.Repeatable
-	 */
-	public static <A extends Annotation> Set<A> getRepeatableAnnotation(Method method,
-			Class<? extends Annotation> containerAnnotationType, Class<A> annotationType) {
-
-		Method resolvedMethod = BridgeMethodResolver.findBridgedMethod(method);
-		return getRepeatableAnnotation((AnnotatedElement) resolvedMethod, containerAnnotationType, annotationType);
-	}
-
-	/**
-	 * Get the <em>repeatable</em> {@link Annotation}s of {@code annotationType}
-	 * from the supplied {@link AnnotatedElement}, where such annotations are
-	 * either <em>present</em> or <em>meta-present</em> on the element.
-	 * <p>Handles both single annotations and annotations nested within a
-	 * <em>containing annotation</em>.
+	 * <em>container annotation</em>.
+	 * <p>Correctly handles <em>bridge methods</em> generated by the
+	 * compiler if the supplied element is a {@link Method}.
 	 * <p>Meta-annotations will be searched if the annotation is not
 	 * <em>present</em> on the supplied element.
-	 * @param annotatedElement the element to look for annotations on; never {@code null}
-	 * @param containerAnnotationType the type of the container that holds the
-	 * annotations; may be {@code null} if a container is not supported
+	 * @param annotatedElement the element to look for annotations on
 	 * @param annotationType the annotation type to look for
-	 * @return the annotations found or an empty set; never {@code null}
-	 * @since 4.0
+	 * @return the annotations found or an empty set (never {@code null})
+	 * @since 4.2
+	 * @see #getRepeatableAnnotations(AnnotatedElement, Class, Class)
+	 * @see #getDeclaredRepeatableAnnotations(AnnotatedElement, Class, Class)
+	 * @see AnnotatedElementUtils#getMergedRepeatableAnnotations(AnnotatedElement, Class)
+	 * @see org.springframework.core.BridgeMethodResolver#findBridgedMethod
 	 * @see java.lang.annotation.Repeatable
+	 * @see java.lang.reflect.AnnotatedElement#getAnnotationsByType
+	 * @deprecated as of 5.2 since it is superseded by the {@link MergedAnnotations} API
 	 */
-	public static <A extends Annotation> Set<A> getRepeatableAnnotation(AnnotatedElement annotatedElement,
-			Class<? extends Annotation> containerAnnotationType, Class<A> annotationType) {
+	@Deprecated
+	public static <A extends Annotation> Set<A> getRepeatableAnnotations(AnnotatedElement annotatedElement,
+			Class<A> annotationType) {
 
-		try {
-			if (annotatedElement.getAnnotations().length > 0) {
-				return new AnnotationCollector<A>(containerAnnotationType, annotationType).getResult(annotatedElement);
-			}
-		}
-		catch (Exception ex) {
-			// Assuming nested Class values not resolvable within annotation attributes...
-			handleIntrospectionFailure(annotatedElement, ex);
-		}
-		return Collections.emptySet();
+		return getRepeatableAnnotations(annotatedElement, annotationType, null);
+	}
+
+	/**
+	 * Get the <em>repeatable</em> {@linkplain Annotation annotations} of
+	 * {@code annotationType} from the supplied {@link AnnotatedElement}, where
+	 * such annotations are either <em>present</em>, <em>indirectly present</em>,
+	 * or <em>meta-present</em> on the element.
+	 * <p>This method mimics the functionality of Java 8's
+	 * {@link java.lang.reflect.AnnotatedElement#getAnnotationsByType(Class)}
+	 * with additional support for meta-annotations.
+	 * <p>Handles both single annotations and annotations nested within a
+	 * <em>container annotation</em>.
+	 * <p>Correctly handles <em>bridge methods</em> generated by the
+	 * compiler if the supplied element is a {@link Method}.
+	 * <p>Meta-annotations will be searched if the annotation is not
+	 * <em>present</em> on the supplied element.
+	 * @param annotatedElement the element to look for annotations on
+	 * @param annotationType the annotation type to look for
+	 * @param containerAnnotationType the type of the container that holds
+	 * the annotations; may be {@code null} if a container is not supported
+	 * or if it should be looked up via @{@link java.lang.annotation.Repeatable}
+	 * when running on Java 8 or higher
+	 * @return the annotations found or an empty set (never {@code null})
+	 * @since 4.2
+	 * @see #getRepeatableAnnotations(AnnotatedElement, Class)
+	 * @see #getDeclaredRepeatableAnnotations(AnnotatedElement, Class)
+	 * @see #getDeclaredRepeatableAnnotations(AnnotatedElement, Class, Class)
+	 * @see AnnotatedElementUtils#getMergedRepeatableAnnotations(AnnotatedElement, Class, Class)
+	 * @see org.springframework.core.BridgeMethodResolver#findBridgedMethod
+	 * @see java.lang.annotation.Repeatable
+	 * @see java.lang.reflect.AnnotatedElement#getAnnotationsByType
+	 * @deprecated as of 5.2 since it is superseded by the {@link MergedAnnotations} API
+	 */
+	@Deprecated
+	public static <A extends Annotation> Set<A> getRepeatableAnnotations(AnnotatedElement annotatedElement,
+			Class<A> annotationType, @Nullable Class<? extends Annotation> containerAnnotationType) {
+
+		RepeatableContainers repeatableContainers = (containerAnnotationType != null ?
+				RepeatableContainers.of(annotationType, containerAnnotationType) :
+				RepeatableContainers.standardRepeatables());
+
+		return MergedAnnotations.from(annotatedElement, SearchStrategy.SUPERCLASS, repeatableContainers)
+				.stream(annotationType)
+				.filter(MergedAnnotationPredicates.firstRunOf(MergedAnnotation::getAggregateIndex))
+				.map(MergedAnnotation::withNonMergedAttributes)
+				.collect(MergedAnnotationCollectors.toAnnotationSet());
+	}
+
+	/**
+	 * Get the declared <em>repeatable</em> {@linkplain Annotation annotations}
+	 * of {@code annotationType} from the supplied {@link AnnotatedElement},
+	 * where such annotations are either <em>directly present</em>,
+	 * <em>indirectly present</em>, or <em>meta-present</em> on the element.
+	 * <p>This method mimics the functionality of Java 8's
+	 * {@link java.lang.reflect.AnnotatedElement#getDeclaredAnnotationsByType(Class)}
+	 * with support for automatic detection of a <em>container annotation</em>
+	 * declared via @{@link java.lang.annotation.Repeatable} (when running on
+	 * Java 8 or higher) and with additional support for meta-annotations.
+	 * <p>Handles both single annotations and annotations nested within a
+	 * <em>container annotation</em>.
+	 * <p>Correctly handles <em>bridge methods</em> generated by the
+	 * compiler if the supplied element is a {@link Method}.
+	 * <p>Meta-annotations will be searched if the annotation is not
+	 * <em>present</em> on the supplied element.
+	 * @param annotatedElement the element to look for annotations on
+	 * @param annotationType the annotation type to look for
+	 * @return the annotations found or an empty set (never {@code null})
+	 * @since 4.2
+	 * @see #getRepeatableAnnotations(AnnotatedElement, Class)
+	 * @see #getRepeatableAnnotations(AnnotatedElement, Class, Class)
+	 * @see #getDeclaredRepeatableAnnotations(AnnotatedElement, Class, Class)
+	 * @see AnnotatedElementUtils#getMergedRepeatableAnnotations(AnnotatedElement, Class)
+	 * @see org.springframework.core.BridgeMethodResolver#findBridgedMethod
+	 * @see java.lang.annotation.Repeatable
+	 * @see java.lang.reflect.AnnotatedElement#getDeclaredAnnotationsByType
+	 * @deprecated as of 5.2 since it is superseded by the {@link MergedAnnotations} API
+	 */
+	@Deprecated
+	public static <A extends Annotation> Set<A> getDeclaredRepeatableAnnotations(AnnotatedElement annotatedElement,
+			Class<A> annotationType) {
+
+		return getDeclaredRepeatableAnnotations(annotatedElement, annotationType, null);
+	}
+
+	/**
+	 * Get the declared <em>repeatable</em> {@linkplain Annotation annotations}
+	 * of {@code annotationType} from the supplied {@link AnnotatedElement},
+	 * where such annotations are either <em>directly present</em>,
+	 * <em>indirectly present</em>, or <em>meta-present</em> on the element.
+	 * <p>This method mimics the functionality of Java 8's
+	 * {@link java.lang.reflect.AnnotatedElement#getDeclaredAnnotationsByType(Class)}
+	 * with additional support for meta-annotations.
+	 * <p>Handles both single annotations and annotations nested within a
+	 * <em>container annotation</em>.
+	 * <p>Correctly handles <em>bridge methods</em> generated by the
+	 * compiler if the supplied element is a {@link Method}.
+	 * <p>Meta-annotations will be searched if the annotation is not
+	 * <em>present</em> on the supplied element.
+	 * @param annotatedElement the element to look for annotations on
+	 * @param annotationType the annotation type to look for
+	 * @param containerAnnotationType the type of the container that holds
+	 * the annotations; may be {@code null} if a container is not supported
+	 * or if it should be looked up via @{@link java.lang.annotation.Repeatable}
+	 * when running on Java 8 or higher
+	 * @return the annotations found or an empty set (never {@code null})
+	 * @since 4.2
+	 * @see #getRepeatableAnnotations(AnnotatedElement, Class)
+	 * @see #getRepeatableAnnotations(AnnotatedElement, Class, Class)
+	 * @see #getDeclaredRepeatableAnnotations(AnnotatedElement, Class)
+	 * @see AnnotatedElementUtils#getMergedRepeatableAnnotations(AnnotatedElement, Class, Class)
+	 * @see org.springframework.core.BridgeMethodResolver#findBridgedMethod
+	 * @see java.lang.annotation.Repeatable
+	 * @see java.lang.reflect.AnnotatedElement#getDeclaredAnnotationsByType
+	 * @deprecated as of 5.2 since it is superseded by the {@link MergedAnnotations} API
+	 */
+	@Deprecated
+	public static <A extends Annotation> Set<A> getDeclaredRepeatableAnnotations(AnnotatedElement annotatedElement,
+			Class<A> annotationType, @Nullable Class<? extends Annotation> containerAnnotationType) {
+
+		RepeatableContainers repeatableContainers = containerAnnotationType != null ?
+				RepeatableContainers.of(annotationType, containerAnnotationType) :
+				RepeatableContainers.standardRepeatables();
+
+		return MergedAnnotations.from(annotatedElement, SearchStrategy.DIRECT, repeatableContainers)
+				.stream(annotationType)
+				.map(MergedAnnotation::withNonMergedAttributes)
+				.collect(MergedAnnotationCollectors.toAnnotationSet());
 	}
 
 	/**
@@ -323,52 +479,29 @@ public abstract class AnnotationUtils {
 	 * @return the first matching annotation, or {@code null} if not found
 	 * @since 4.2
 	 */
-	public static <A extends Annotation> A findAnnotation(AnnotatedElement annotatedElement, Class<A> annotationType) {
-		// Do NOT store result in the findAnnotationCache since doing so could break
-		// findAnnotation(Class, Class) and findAnnotation(Method, Class).
-		return synthesizeAnnotation(findAnnotation(annotatedElement, annotationType, new HashSet<Annotation>()),
-			annotatedElement);
-	}
+	@Nullable
+	public static <A extends Annotation> A findAnnotation(
+			AnnotatedElement annotatedElement, @Nullable Class<A> annotationType) {
 
-	/**
-	 * Perform the search algorithm for {@link #findAnnotation(AnnotatedElement, Class)}
-	 * avoiding endless recursion by tracking which annotations have already
-	 * been <em>visited</em>.
-	 * @param annotatedElement the {@code AnnotatedElement} on which to find the annotation
-	 * @param annotationType the annotation type to look for, both locally and as a meta-annotation
-	 * @param visited the set of annotations that have already been visited
-	 * @return the first matching annotation, or {@code null} if not found
-	 * @since 4.2
-	 */
-	@SuppressWarnings("unchecked")
-	private static <A extends Annotation> A findAnnotation(AnnotatedElement annotatedElement, Class<A> annotationType, Set<Annotation> visited) {
-		Assert.notNull(annotatedElement, "AnnotatedElement must not be null");
-		try {
-			Annotation[] anns = annotatedElement.getDeclaredAnnotations();
-			for (Annotation ann : anns) {
-				if (ann.annotationType().equals(annotationType)) {
-					return (A) ann;
-				}
-			}
-			for (Annotation ann : anns) {
-				if (!isInJavaLangAnnotationPackage(ann) && visited.add(ann)) {
-					A annotation = findAnnotation((AnnotatedElement) ann.annotationType(), annotationType, visited);
-					if (annotation != null) {
-						return annotation;
-					}
-				}
-			}
+		if (annotationType == null) {
+			return null;
 		}
-		catch (Exception ex) {
-			// Assuming nested Class values not resolvable within annotation attributes...
-			handleIntrospectionFailure(annotatedElement, ex);
+
+		// Shortcut: directly present on the element, with no merging needed?
+		if (AnnotationFilter.PLAIN.matches(annotationType) ||
+				AnnotationsScanner.hasPlainJavaAnnotationsOnly(annotatedElement)) {
+			return annotatedElement.getDeclaredAnnotation(annotationType);
 		}
-		return null;
+
+		// Exhaustive retrieval of merged annotations...
+		return MergedAnnotations.from(annotatedElement, SearchStrategy.INHERITED_ANNOTATIONS, RepeatableContainers.none())
+				.get(annotationType).withNonMergedAttributes()
+				.synthesize(MergedAnnotation::isPresent).orElse(null);
 	}
 
 	/**
 	 * Find a single {@link Annotation} of {@code annotationType} on the supplied
-	 * {@link Method}, traversing its super methods (i.e., from superclasses and
+	 * {@link Method}, traversing its super methods (i.e. from superclasses and
 	 * interfaces) if the annotation is not <em>directly present</em> on the given
 	 * method itself.
 	 * <p>Correctly handles bridge {@link Method Methods} generated by the compiler.
@@ -381,85 +514,22 @@ public abstract class AnnotationUtils {
 	 * @return the first matching annotation, or {@code null} if not found
 	 * @see #getAnnotation(Method, Class)
 	 */
-	@SuppressWarnings("unchecked")
-	public static <A extends Annotation> A findAnnotation(Method method, Class<A> annotationType) {
-		AnnotationCacheKey cacheKey = new AnnotationCacheKey(method, annotationType);
-		A result = (A) findAnnotationCache.get(cacheKey);
-
-		if (result == null) {
-			Method resolvedMethod = BridgeMethodResolver.findBridgedMethod(method);
-			result = findAnnotation((AnnotatedElement) resolvedMethod, annotationType);
-
-			if (result == null) {
-				result = searchOnInterfaces(method, annotationType, method.getDeclaringClass().getInterfaces());
-			}
-
-			Class<?> clazz = method.getDeclaringClass();
-			while (result == null) {
-				clazz = clazz.getSuperclass();
-				if (clazz == null || Object.class == clazz) {
-					break;
-				}
-				try {
-					Method equivalentMethod = clazz.getDeclaredMethod(method.getName(), method.getParameterTypes());
-					Method resolvedEquivalentMethod = BridgeMethodResolver.findBridgedMethod(equivalentMethod);
-					result = findAnnotation((AnnotatedElement) resolvedEquivalentMethod, annotationType);
-				}
-				catch (NoSuchMethodException ex) {
-					// No equivalent method found
-				}
-				if (result == null) {
-					result = searchOnInterfaces(method, annotationType, clazz.getInterfaces());
-				}
-			}
-
-			if (result != null) {
-				findAnnotationCache.put(cacheKey, result);
-			}
+	@Nullable
+	public static <A extends Annotation> A findAnnotation(Method method, @Nullable Class<A> annotationType) {
+		if (annotationType == null) {
+			return null;
 		}
 
-		return synthesizeAnnotation(result, method);
-	}
+		// Shortcut: directly present on the element, with no merging needed?
+		if (AnnotationFilter.PLAIN.matches(annotationType) ||
+				AnnotationsScanner.hasPlainJavaAnnotationsOnly(method)) {
+			return method.getDeclaredAnnotation(annotationType);
+		}
 
-	private static <A extends Annotation> A searchOnInterfaces(Method method, Class<A> annotationType, Class<?>... ifcs) {
-		A annotation = null;
-		for (Class<?> iface : ifcs) {
-			if (isInterfaceWithAnnotatedMethods(iface)) {
-				try {
-					Method equivalentMethod = iface.getMethod(method.getName(), method.getParameterTypes());
-					annotation = getAnnotation(equivalentMethod, annotationType);
-				}
-				catch (NoSuchMethodException ex) {
-					// Skip this interface - it doesn't have the method...
-				}
-				if (annotation != null) {
-					break;
-				}
-			}
-		}
-		return annotation;
-	}
-
-	static boolean isInterfaceWithAnnotatedMethods(Class<?> iface) {
-		Boolean found = annotatedInterfaceCache.get(iface);
-		if (found != null) {
-			return found.booleanValue();
-		}
-		found = Boolean.FALSE;
-		for (Method ifcMethod : iface.getMethods()) {
-			try {
-				if (ifcMethod.getAnnotations().length > 0) {
-					found = Boolean.TRUE;
-					break;
-				}
-			}
-			catch (Exception ex) {
-				// Assuming nested Class values not resolvable within annotation attributes...
-				handleIntrospectionFailure(ifcMethod, ex);
-			}
-		}
-		annotatedInterfaceCache.put(iface, found);
-		return found.booleanValue();
+		// Exhaustive retrieval of merged annotations...
+		return MergedAnnotations.from(method, SearchStrategy.TYPE_HIERARCHY, RepeatableContainers.none())
+				.get(annotationType).withNonMergedAttributes()
+				.synthesize(MergedAnnotation::isPresent).orElse(null);
 	}
 
 	/**
@@ -484,66 +554,32 @@ public abstract class AnnotationUtils {
 	 * @param annotationType the type of annotation to look for
 	 * @return the first matching annotation, or {@code null} if not found
 	 */
-	@SuppressWarnings("unchecked")
-	public static <A extends Annotation> A findAnnotation(Class<?> clazz, Class<A> annotationType) {
-		AnnotationCacheKey cacheKey = new AnnotationCacheKey(clazz, annotationType);
-		A result = (A) findAnnotationCache.get(cacheKey);
-		if (result == null) {
-			result = findAnnotation(clazz, annotationType, new HashSet<Annotation>());
-			if (result != null) {
-				findAnnotationCache.put(cacheKey, result);
-			}
-		}
-		return synthesizeAnnotation(result, clazz);
-	}
-
-	/**
-	 * Perform the search algorithm for {@link #findAnnotation(Class, Class)},
-	 * avoiding endless recursion by tracking which annotations have already
-	 * been <em>visited</em>.
-	 * @param clazz the class to look for annotations on
-	 * @param annotationType the type of annotation to look for
-	 * @param visited the set of annotations that have already been visited
-	 * @return the first matching annotation, or {@code null} if not found
-	 */
-	@SuppressWarnings("unchecked")
-	private static <A extends Annotation> A findAnnotation(Class<?> clazz, Class<A> annotationType, Set<Annotation> visited) {
-		Assert.notNull(clazz, "Class must not be null");
-
-		try {
-			Annotation[] anns = clazz.getDeclaredAnnotations();
-			for (Annotation ann : anns) {
-				if (ann.annotationType().equals(annotationType)) {
-					return (A) ann;
-				}
-			}
-			for (Annotation ann : anns) {
-				if (!isInJavaLangAnnotationPackage(ann) && visited.add(ann)) {
-					A annotation = findAnnotation(ann.annotationType(), annotationType, visited);
-					if (annotation != null) {
-						return annotation;
-					}
-				}
-			}
-		}
-		catch (Exception ex) {
-			// Assuming nested Class values not resolvable within annotation attributes...
-			handleIntrospectionFailure(clazz, ex);
+	@Nullable
+	public static <A extends Annotation> A findAnnotation(Class<?> clazz, @Nullable Class<A> annotationType) {
+		if (annotationType == null) {
 			return null;
 		}
 
-		for (Class<?> ifc : clazz.getInterfaces()) {
-			A annotation = findAnnotation(ifc, annotationType, visited);
+		// Shortcut: directly present on the element, with no merging needed?
+		if (AnnotationFilter.PLAIN.matches(annotationType) ||
+				AnnotationsScanner.hasPlainJavaAnnotationsOnly(clazz)) {
+			A annotation = clazz.getDeclaredAnnotation(annotationType);
 			if (annotation != null) {
 				return annotation;
 			}
+			// For backwards compatibility, perform a superclass search with plain annotations
+			// even if not marked as @Inherited: e.g. a findAnnotation search for @Deprecated
+			Class<?> superclass = clazz.getSuperclass();
+			if (superclass == null || superclass == Object.class) {
+				return null;
+			}
+			return findAnnotation(superclass, annotationType);
 		}
 
-		Class<?> superclass = clazz.getSuperclass();
-		if (superclass == null || Object.class == superclass) {
-			return null;
-		}
-		return findAnnotation(superclass, annotationType, visited);
+		// Exhaustive retrieval of merged annotations...
+		return MergedAnnotations.from(clazz, SearchStrategy.TYPE_HIERARCHY, RepeatableContainers.none())
+				.get(annotationType).withNonMergedAttributes()
+				.synthesize(MergedAnnotation::isPresent).orElse(null);
 	}
 
 	/**
@@ -561,22 +597,24 @@ public abstract class AnnotationUtils {
 	 * @param annotationType the annotation type to look for
 	 * @param clazz the class to check for the annotation on (may be {@code null})
 	 * @return the first {@link Class} in the inheritance hierarchy that
-	 * declares an annotation of the specified {@code annotationType}, or
-	 * {@code null} if not found
+	 * declares an annotation of the specified {@code annotationType},
+	 * or {@code null} if not found
 	 * @see Class#isAnnotationPresent(Class)
 	 * @see Class#getDeclaredAnnotations()
-	 * @see #findAnnotationDeclaringClassForTypes(List, Class)
-	 * @see #isAnnotationDeclaredLocally(Class, Class)
+	 * @deprecated as of 5.2 since it is superseded by the {@link MergedAnnotations} API
 	 */
-	public static Class<?> findAnnotationDeclaringClass(Class<? extends Annotation> annotationType, Class<?> clazz) {
-		Assert.notNull(annotationType, "Annotation type must not be null");
-		if (clazz == null || Object.class == clazz) {
+	@Deprecated
+	@Nullable
+	public static Class<?> findAnnotationDeclaringClass(
+			Class<? extends Annotation> annotationType, @Nullable Class<?> clazz) {
+
+		if (clazz == null) {
 			return null;
 		}
-		if (isAnnotationDeclaredLocally(annotationType, clazz)) {
-			return clazz;
-		}
-		return findAnnotationDeclaringClass(annotationType, clazz.getSuperclass());
+
+		return (Class<?>) MergedAnnotations.from(clazz, SearchStrategy.SUPERCLASS)
+				.get(annotationType, MergedAnnotation::isDirectlyPresent)
+				.getSource();
 	}
 
 	/**
@@ -593,74 +631,60 @@ public abstract class AnnotationUtils {
 	 * one of several candidate {@linkplain Annotation annotations}, so we
 	 * need to handle this explicitly.
 	 * @param annotationTypes the annotation types to look for
-	 * @param clazz the class to check for the annotations on, or {@code null}
+	 * @param clazz the class to check for the annotation on (may be {@code null})
 	 * @return the first {@link Class} in the inheritance hierarchy that
 	 * declares an annotation of at least one of the specified
 	 * {@code annotationTypes}, or {@code null} if not found
 	 * @since 3.2.2
 	 * @see Class#isAnnotationPresent(Class)
 	 * @see Class#getDeclaredAnnotations()
-	 * @see #findAnnotationDeclaringClass(Class, Class)
-	 * @see #isAnnotationDeclaredLocally(Class, Class)
+	 * @deprecated as of 5.2 since it is superseded by the {@link MergedAnnotations} API
 	 */
-	public static Class<?> findAnnotationDeclaringClassForTypes(List<Class<? extends Annotation>> annotationTypes, Class<?> clazz) {
-		Assert.notEmpty(annotationTypes, "The list of annotation types must not be empty");
-		if (clazz == null || Object.class == clazz) {
+	@Deprecated
+	@Nullable
+	public static Class<?> findAnnotationDeclaringClassForTypes(
+			List<Class<? extends Annotation>> annotationTypes, @Nullable Class<?> clazz) {
+
+		if (clazz == null) {
 			return null;
 		}
-		for (Class<? extends Annotation> annotationType : annotationTypes) {
-			if (isAnnotationDeclaredLocally(annotationType, clazz)) {
-				return clazz;
-			}
-		}
-		return findAnnotationDeclaringClassForTypes(annotationTypes, clazz.getSuperclass());
+
+		return (Class<?>) MergedAnnotations.from(clazz, SearchStrategy.SUPERCLASS)
+				.stream()
+				.filter(MergedAnnotationPredicates.typeIn(annotationTypes).and(MergedAnnotation::isDirectlyPresent))
+				.map(MergedAnnotation::getSource)
+				.findFirst().orElse(null);
 	}
 
 	/**
 	 * Determine whether an annotation of the specified {@code annotationType}
-	 * is declared locally (i.e., <em>directly present</em>) on the supplied
+	 * is declared locally (i.e. <em>directly present</em>) on the supplied
 	 * {@code clazz}.
 	 * <p>The supplied {@link Class} may represent any type.
 	 * <p>Meta-annotations will <em>not</em> be searched.
 	 * <p>Note: This method does <strong>not</strong> determine if the annotation
-	 * is {@linkplain java.lang.annotation.Inherited inherited}. For greater
-	 * clarity regarding inherited annotations, consider using
-	 * {@link #isAnnotationInherited(Class, Class)} instead.
+	 * is {@linkplain java.lang.annotation.Inherited inherited}.
 	 * @param annotationType the annotation type to look for
 	 * @param clazz the class to check for the annotation on
 	 * @return {@code true} if an annotation of the specified {@code annotationType}
 	 * is <em>directly present</em>
 	 * @see java.lang.Class#getDeclaredAnnotations()
 	 * @see java.lang.Class#getDeclaredAnnotation(Class)
-	 * @see #isAnnotationInherited(Class, Class)
 	 */
 	public static boolean isAnnotationDeclaredLocally(Class<? extends Annotation> annotationType, Class<?> clazz) {
-		Assert.notNull(annotationType, "Annotation type must not be null");
-		Assert.notNull(clazz, "Class must not be null");
-		try {
-			for (Annotation ann : clazz.getDeclaredAnnotations()) {
-				if (ann.annotationType().equals(annotationType)) {
-					return true;
-				}
-			}
-		}
-		catch (Exception ex) {
-			// Assuming nested Class values not resolvable within annotation attributes...
-			handleIntrospectionFailure(clazz, ex);
-		}
-		return false;
+		return MergedAnnotations.from(clazz).get(annotationType).isDirectlyPresent();
 	}
 
 	/**
 	 * Determine whether an annotation of the specified {@code annotationType}
 	 * is <em>present</em> on the supplied {@code clazz} and is
-	 * {@linkplain java.lang.annotation.Inherited inherited} (i.e., not
-	 * <em>directly present</em>).
+	 * {@linkplain java.lang.annotation.Inherited inherited}
+	 * (i.e. not <em>directly present</em>).
 	 * <p>Meta-annotations will <em>not</em> be searched.
 	 * <p>If the supplied {@code clazz} is an interface, only the interface
 	 * itself will be checked. In accordance with standard meta-annotation
 	 * semantics in Java, the inheritance hierarchy for interfaces will not
-	 * be traversed. See the {@linkplain java.lang.annotation.Inherited Javadoc}
+	 * be traversed. See the {@linkplain java.lang.annotation.Inherited javadoc}
 	 * for the {@code @Inherited} meta-annotation for further details regarding
 	 * annotation inheritance.
 	 * @param annotationType the annotation type to look for
@@ -669,34 +693,78 @@ public abstract class AnnotationUtils {
 	 * is <em>present</em> and <em>inherited</em>
 	 * @see Class#isAnnotationPresent(Class)
 	 * @see #isAnnotationDeclaredLocally(Class, Class)
+	 * @deprecated as of 5.2 since it is superseded by the {@link MergedAnnotations} API
 	 */
+	@Deprecated
 	public static boolean isAnnotationInherited(Class<? extends Annotation> annotationType, Class<?> clazz) {
-		Assert.notNull(annotationType, "Annotation type must not be null");
-		Assert.notNull(clazz, "Class must not be null");
-		return (clazz.isAnnotationPresent(annotationType) && !isAnnotationDeclaredLocally(annotationType, clazz));
+		return MergedAnnotations.from(clazz, SearchStrategy.INHERITED_ANNOTATIONS)
+				.stream(annotationType)
+				.filter(MergedAnnotation::isDirectlyPresent)
+				.findFirst().orElseGet(MergedAnnotation::missing)
+				.getAggregateIndex() > 0;
+	}
+
+	/**
+	 * Determine if an annotation of type {@code metaAnnotationType} is
+	 * <em>meta-present</em> on the supplied {@code annotationType}.
+	 * @param annotationType the annotation type to search on
+	 * @param metaAnnotationType the type of meta-annotation to search for
+	 * @return {@code true} if such an annotation is meta-present
+	 * @since 4.2.1
+	 * @deprecated as of 5.2 since it is superseded by the {@link MergedAnnotations} API
+	 */
+	@Deprecated
+	public static boolean isAnnotationMetaPresent(Class<? extends Annotation> annotationType,
+			@Nullable Class<? extends Annotation> metaAnnotationType) {
+
+		if (metaAnnotationType == null) {
+			return false;
+		}
+		// Shortcut: directly present on the element, with no merging needed?
+		if (AnnotationFilter.PLAIN.matches(metaAnnotationType) ||
+				AnnotationsScanner.hasPlainJavaAnnotationsOnly(annotationType)) {
+			return annotationType.isAnnotationPresent(metaAnnotationType);
+		}
+		// Exhaustive retrieval of merged annotations...
+		return MergedAnnotations.from(annotationType, SearchStrategy.INHERITED_ANNOTATIONS,
+				RepeatableContainers.none()).isPresent(metaAnnotationType);
 	}
 
 	/**
 	 * Determine if the supplied {@link Annotation} is defined in the core JDK
 	 * {@code java.lang.annotation} package.
-	 * @param annotation the annotation to check (never {@code null})
+	 * @param annotation the annotation to check
 	 * @return {@code true} if the annotation is in the {@code java.lang.annotation} package
 	 */
-	public static boolean isInJavaLangAnnotationPackage(Annotation annotation) {
-		Assert.notNull(annotation, "Annotation must not be null");
-		return isInJavaLangAnnotationPackage(annotation.annotationType().getName());
+	public static boolean isInJavaLangAnnotationPackage(@Nullable Annotation annotation) {
+		return (annotation != null && JAVA_LANG_ANNOTATION_FILTER.matches(annotation));
 	}
 
 	/**
 	 * Determine if the {@link Annotation} with the supplied name is defined
 	 * in the core JDK {@code java.lang.annotation} package.
-	 * @param annotationType the name of the annotation type to check (never {@code null} or empty)
+	 * @param annotationType the name of the annotation type to check
 	 * @return {@code true} if the annotation is in the {@code java.lang.annotation} package
 	 * @since 4.2
 	 */
-	public static boolean isInJavaLangAnnotationPackage(String annotationType) {
-		Assert.hasText(annotationType, "annotationType must not be null or empty");
-		return annotationType.startsWith("java.lang.annotation");
+	public static boolean isInJavaLangAnnotationPackage(@Nullable String annotationType) {
+		return (annotationType != null && JAVA_LANG_ANNOTATION_FILTER.matches(annotationType));
+	}
+
+	/**
+	 * Check the declared attributes of the given annotation, in particular covering
+	 * Google App Engine's late arrival of {@code TypeNotPresentExceptionProxy} for
+	 * {@code Class} values (instead of early {@code Class.getAnnotations() failure}.
+	 * <p>This method not failing indicates that {@link #getAnnotationAttributes(Annotation)}
+	 * won't failure either (when attempted later on).
+	 * @param annotation the annotation to validate
+	 * @throws IllegalStateException if a declared {@code Class} attribute could not be read
+	 * @since 4.3.15
+	 * @see Class#getAnnotations()
+	 * @see #getAnnotationAttributes(Annotation)
+	 */
+	public static void validateAnnotation(Annotation annotation) {
+		AttributeMethods.forAnnotationType(annotation.annotationType()).validate(annotation);
 	}
 
 	/**
@@ -709,7 +777,7 @@ public abstract class AnnotationUtils {
 	 * However, the {@code Map} signature has been preserved for binary compatibility.
 	 * @param annotation the annotation to retrieve the attributes for
 	 * @return the Map of annotation attributes, with attribute names as keys and
-	 * corresponding attribute values as values; never {@code null}
+	 * corresponding attribute values as values (never {@code null})
 	 * @see #getAnnotationAttributes(AnnotatedElement, Annotation)
 	 * @see #getAnnotationAttributes(Annotation, boolean, boolean)
 	 * @see #getAnnotationAttributes(AnnotatedElement, Annotation, boolean, boolean)
@@ -729,10 +797,12 @@ public abstract class AnnotationUtils {
 	 * compatibility with {@link org.springframework.core.type.AnnotationMetadata})
 	 * or to preserve them as Class references
 	 * @return the Map of annotation attributes, with attribute names as keys and
-	 * corresponding attribute values as values; never {@code null}
+	 * corresponding attribute values as values (never {@code null})
 	 * @see #getAnnotationAttributes(Annotation, boolean, boolean)
 	 */
-	public static Map<String, Object> getAnnotationAttributes(Annotation annotation, boolean classValuesAsString) {
+	public static Map<String, Object> getAnnotationAttributes(
+			Annotation annotation, boolean classValuesAsString) {
+
 		return getAnnotationAttributes(annotation, classValuesAsString, false);
 	}
 
@@ -749,11 +819,12 @@ public abstract class AnnotationUtils {
 	 * {@link org.springframework.core.type.AnnotationMetadata}) or to preserve them as
 	 * {@code Annotation} instances
 	 * @return the annotation attributes (a specialized Map) with attribute names as keys
-	 * and corresponding attribute values as values; never {@code null}
+	 * and corresponding attribute values as values (never {@code null})
 	 * @since 3.1.1
 	 */
-	public static AnnotationAttributes getAnnotationAttributes(Annotation annotation, boolean classValuesAsString,
-			boolean nestedAnnotationsAsMap) {
+	public static AnnotationAttributes getAnnotationAttributes(
+			Annotation annotation, boolean classValuesAsString, boolean nestedAnnotationsAsMap) {
+
 		return getAnnotationAttributes(null, annotation, classValuesAsString, nestedAnnotationsAsMap);
 	}
 
@@ -766,11 +837,13 @@ public abstract class AnnotationUtils {
 	 * may be {@code null} if unknown
 	 * @param annotation the annotation to retrieve the attributes for
 	 * @return the annotation attributes (a specialized Map) with attribute names as keys
-	 * and corresponding attribute values as values; never {@code null}
+	 * and corresponding attribute values as values (never {@code null})
 	 * @since 4.2
 	 * @see #getAnnotationAttributes(AnnotatedElement, Annotation, boolean, boolean)
 	 */
-	public static AnnotationAttributes getAnnotationAttributes(AnnotatedElement annotatedElement, Annotation annotation) {
+	public static AnnotationAttributes getAnnotationAttributes(
+			@Nullable AnnotatedElement annotatedElement, Annotation annotation) {
+
 		return getAnnotationAttributes(annotatedElement, annotation, false, false);
 	}
 
@@ -789,149 +862,163 @@ public abstract class AnnotationUtils {
 	 * {@link org.springframework.core.type.AnnotationMetadata}) or to preserve them as
 	 * {@code Annotation} instances
 	 * @return the annotation attributes (a specialized Map) with attribute names as keys
-	 * and corresponding attribute values as values; never {@code null}
+	 * and corresponding attribute values as values (never {@code null})
 	 * @since 4.2
 	 */
-	public static AnnotationAttributes getAnnotationAttributes(AnnotatedElement annotatedElement,
-			Annotation annotation, boolean classValuesAsString, boolean nestedAnnotationsAsMap) {
+	public static AnnotationAttributes getAnnotationAttributes(
+			@Nullable AnnotatedElement annotatedElement, Annotation annotation,
+			boolean classValuesAsString, boolean nestedAnnotationsAsMap) {
 
-		return getAnnotationAttributes(annotatedElement, annotation, classValuesAsString, nestedAnnotationsAsMap, false);
+		Adapt[] adaptations = Adapt.values(classValuesAsString, nestedAnnotationsAsMap);
+		return MergedAnnotation.from(annotatedElement, annotation)
+				.withNonMergedAttributes()
+				.asMap(mergedAnnotation ->
+						new AnnotationAttributes(mergedAnnotation.getType(), true), adaptations);
 	}
 
 	/**
-	 * Retrieve the given annotation's attributes as an {@link AnnotationAttributes} map.
-	 *
-	 * <p>This method provides fully recursive annotation reading capabilities on par with
-	 * the reflection-based {@link org.springframework.core.type.StandardAnnotationMetadata}.
-	 *
-	 * <p><strong>NOTE</strong>: This variant of {@code getAnnotationAttributes()} is
-	 * only intended for use within the framework. Specifically, the {@code mergeMode} flag
-	 * can be set to {@code true} in order to support processing of attribute aliases while
-	 * merging attributes within an annotation hierarchy. When running in <em>merge mode</em>,
-	 * the following special rules apply:
-	 * <ol>
-	 * <li>The supplied annotation will <em>not</em> be
-	 * {@linkplain #synthesizeAnnotation synthesized} before retrieving its attributes;
-	 * however, nested annotations and arrays of nested annotations <em>will</em> be
-	 * synthesized.</li>
-	 * <li>Default values will be replaced with {@link #DEFAULT_VALUE_PLACEHOLDER}.</li>
-	 * <li>The resulting, merged annotation attributes should eventually be
-	 * {@linkplain #postProcessAnnotationAttributes post-processed} in order to
-	 * ensure that placeholders have been replaced by actual default values and
-	 * in order to enforce {@code @AliasFor} semantics.</li>
-	 * </ol>
-	 *
-	 * @param annotatedElement the element that is annotated with the supplied annotation;
+	 * Register the annotation-declared default values for the given attributes,
+	 * if available.
+	 * @param attributes the annotation attributes to process
+	 * @since 4.3.2
+	 */
+	public static void registerDefaultValues(AnnotationAttributes attributes) {
+		Class<? extends Annotation> annotationType = attributes.annotationType();
+		if (annotationType != null && Modifier.isPublic(annotationType.getModifiers()) &&
+				!AnnotationFilter.PLAIN.matches(annotationType)) {
+			Map<String, DefaultValueHolder> defaultValues = getDefaultValues(annotationType);
+			defaultValues.forEach(attributes::putIfAbsent);
+		}
+	}
+
+	private static Map<String, DefaultValueHolder> getDefaultValues(
+			Class<? extends Annotation> annotationType) {
+
+		return defaultValuesCache.computeIfAbsent(annotationType,
+				AnnotationUtils::computeDefaultValues);
+	}
+
+	private static Map<String, DefaultValueHolder> computeDefaultValues(
+			Class<? extends Annotation> annotationType) {
+
+		AttributeMethods methods = AttributeMethods.forAnnotationType(annotationType);
+		if (!methods.hasDefaultValueMethod()) {
+			return Collections.emptyMap();
+		}
+		Map<String, DefaultValueHolder> result = CollectionUtils.newLinkedHashMap(methods.size());
+		if (!methods.hasNestedAnnotation()) {
+			// Use simpler method if there are no nested annotations
+			for (int i = 0; i < methods.size(); i++) {
+				Method method = methods.get(i);
+				Object defaultValue = method.getDefaultValue();
+				if (defaultValue != null) {
+					result.put(method.getName(), new DefaultValueHolder(defaultValue));
+				}
+			}
+		}
+		else {
+			// If we have nested annotations, we need them as nested maps
+			AnnotationAttributes attributes = MergedAnnotation.of(annotationType)
+					.asMap(annotation ->
+							new AnnotationAttributes(annotation.getType(), true), Adapt.ANNOTATION_TO_MAP);
+			for (Map.Entry<String, Object> element : attributes.entrySet()) {
+				result.put(element.getKey(), new DefaultValueHolder(element.getValue()));
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * Post-process the supplied {@link AnnotationAttributes}, preserving nested
+	 * annotations as {@code Annotation} instances.
+	 * <p>Specifically, this method enforces <em>attribute alias</em> semantics
+	 * for annotation attributes that are annotated with {@link AliasFor @AliasFor}
+	 * and replaces default value placeholders with their original default values.
+	 * @param annotatedElement the element that is annotated with an annotation or
+	 * annotation hierarchy from which the supplied attributes were created;
 	 * may be {@code null} if unknown
-	 * @param annotation the annotation to retrieve the attributes for
+	 * @param attributes the annotation attributes to post-process
 	 * @param classValuesAsString whether to convert Class references into Strings (for
 	 * compatibility with {@link org.springframework.core.type.AnnotationMetadata})
 	 * or to preserve them as Class references
-	 * @param nestedAnnotationsAsMap whether to convert nested annotations into
-	 * {@link AnnotationAttributes} maps (for compatibility with
-	 * {@link org.springframework.core.type.AnnotationMetadata}) or to preserve them as
-	 * {@code Annotation} instances
-	 * @param mergeMode whether the annotation attributes should be created
-	 * using <em>merge mode</em>
-	 * @return the annotation attributes (a specialized Map) with attribute names as keys
-	 * and corresponding attribute values as values; never {@code null}
-	 * @since 4.2
-	 * @see #postProcessAnnotationAttributes
+	 * @since 4.3.2
+	 * @see #getDefaultValue(Class, String)
 	 */
-	static AnnotationAttributes getAnnotationAttributes(AnnotatedElement annotatedElement, Annotation annotation,
-			boolean classValuesAsString, boolean nestedAnnotationsAsMap, boolean mergeMode) {
+	public static void postProcessAnnotationAttributes(@Nullable Object annotatedElement,
+			@Nullable AnnotationAttributes attributes, boolean classValuesAsString) {
 
-		if (!mergeMode) {
-			annotation = synthesizeAnnotation(annotation, annotatedElement);
+		if (attributes == null) {
+			return;
 		}
-
-		Class<? extends Annotation> annotationType = annotation.annotationType();
-		AnnotationAttributes attrs = new AnnotationAttributes(annotationType);
-		for (Method method : getAttributeMethods(annotationType)) {
-			try {
-				Object value = method.invoke(annotation);
-				Object defaultValue = method.getDefaultValue();
-				if (mergeMode && (defaultValue != null)) {
-					if (ObjectUtils.nullSafeEquals(value, defaultValue)) {
-						value = DEFAULT_VALUE_PLACEHOLDER;
+		if (!attributes.validated) {
+			Class<? extends Annotation> annotationType = attributes.annotationType();
+			if (annotationType == null) {
+				return;
+			}
+			AnnotationTypeMapping mapping = AnnotationTypeMappings.forAnnotationType(annotationType).get(0);
+			for (int i = 0; i < mapping.getMirrorSets().size(); i++) {
+				MirrorSet mirrorSet = mapping.getMirrorSets().get(i);
+				int resolved = mirrorSet.resolve(attributes.displayName, attributes,
+						AnnotationUtils::getAttributeValueForMirrorResolution);
+				if (resolved != -1) {
+					Method attribute = mapping.getAttributes().get(resolved);
+					Object value = attributes.get(attribute.getName());
+					for (int j = 0; j < mirrorSet.size(); j++) {
+						Method mirror = mirrorSet.get(j);
+						if (mirror != attribute) {
+							attributes.put(mirror.getName(),
+									adaptValue(annotatedElement, value, classValuesAsString));
+						}
 					}
 				}
-				attrs.put(method.getName(),
-					adaptValue(annotatedElement, value, classValuesAsString, nestedAnnotationsAsMap));
-			}
-			catch (Exception ex) {
-				if (ex instanceof InvocationTargetException) {
-					Throwable targetException = ((InvocationTargetException) ex).getTargetException();
-					rethrowAnnotationConfigurationException(targetException);
-				}
-				throw new IllegalStateException("Could not obtain annotation attribute value for " + method, ex);
 			}
 		}
-		return attrs;
+		for (Map.Entry<String, Object> attributeEntry : attributes.entrySet()) {
+			String attributeName = attributeEntry.getKey();
+			Object value = attributeEntry.getValue();
+			if (value instanceof DefaultValueHolder) {
+				value = ((DefaultValueHolder) value).defaultValue;
+				attributes.put(attributeName,
+						adaptValue(annotatedElement, value, classValuesAsString));
+			}
+		}
 	}
 
-	/**
-	 * Adapt the given value according to the given class and nested annotation settings.
-	 * <p>Nested annotations will be
-	 * {@linkplain #synthesizeAnnotation(Annotation, AnnotatedElement) synthesized}.
-	 * @param annotatedElement the element that is annotated, used for contextual
-	 * logging; may be {@code null} if unknown
-	 * @param value the annotation attribute value
-	 * @param classValuesAsString whether to convert Class references into Strings (for
-	 * compatibility with {@link org.springframework.core.type.AnnotationMetadata})
-	 * or to preserve them as Class references
-	 * @param nestedAnnotationsAsMap whether to convert nested annotations into
-	 * {@link AnnotationAttributes} maps (for compatibility with
-	 * {@link org.springframework.core.type.AnnotationMetadata}) or to preserve them as
-	 * {@code Annotation} instances
-	 * @return the adapted value, or the original value if no adaptation is needed
-	 */
-	static Object adaptValue(AnnotatedElement annotatedElement, Object value, boolean classValuesAsString,
-			boolean nestedAnnotationsAsMap) {
+	private static Object getAttributeValueForMirrorResolution(Method attribute, Object attributes) {
+		Object result = ((AnnotationAttributes) attributes).get(attribute.getName());
+		return (result instanceof DefaultValueHolder ? ((DefaultValueHolder) result).defaultValue : result);
+	}
+
+	@Nullable
+	private static Object adaptValue(
+			@Nullable Object annotatedElement, @Nullable Object value, boolean classValuesAsString) {
 
 		if (classValuesAsString) {
 			if (value instanceof Class) {
 				return ((Class<?>) value).getName();
 			}
-			else if (value instanceof Class[]) {
-				Class<?>[] clazzArray = (Class<?>[]) value;
-				String[] classNames = new String[clazzArray.length];
-				for (int i = 0; i < clazzArray.length; i++) {
-					classNames[i] = clazzArray[i].getName();
+			if (value instanceof Class[]) {
+				Class<?>[] classes = (Class<?>[]) value;
+				String[] names = new String[classes.length];
+				for (int i = 0; i < classes.length; i++) {
+					names[i] = classes[i].getName();
 				}
-				return classNames;
+				return names;
 			}
 		}
-
 		if (value instanceof Annotation) {
 			Annotation annotation = (Annotation) value;
-
-			if (nestedAnnotationsAsMap) {
-				return getAnnotationAttributes(annotatedElement, annotation, classValuesAsString,
-					nestedAnnotationsAsMap);
-			}
-			else {
-				return synthesizeAnnotation(annotation, annotatedElement);
-			}
+			return MergedAnnotation.from(annotatedElement, annotation).synthesize();
 		}
-
 		if (value instanceof Annotation[]) {
 			Annotation[] annotations = (Annotation[]) value;
-
-			if (nestedAnnotationsAsMap) {
-				AnnotationAttributes[] mappedAnnotations = new AnnotationAttributes[annotations.length];
-				for (int i = 0; i < annotations.length; i++) {
-					mappedAnnotations[i] = getAnnotationAttributes(annotatedElement, annotations[i],
-						classValuesAsString, nestedAnnotationsAsMap);
-				}
-				return mappedAnnotations;
+			Annotation[] synthesized = (Annotation[]) Array.newInstance(
+					annotations.getClass().getComponentType(), annotations.length);
+			for (int i = 0; i < annotations.length; i++) {
+				synthesized[i] = MergedAnnotation.from(annotatedElement, annotations[i]).synthesize();
 			}
-			else {
-				return synthesizeAnnotationArray(annotations, annotatedElement);
-			}
+			return synthesized;
 		}
-
-		// Fallback
 		return value;
 	}
 
@@ -939,9 +1026,12 @@ public abstract class AnnotationUtils {
 	 * Retrieve the <em>value</em> of the {@code value} attribute of a
 	 * single-element Annotation, given an annotation instance.
 	 * @param annotation the annotation instance from which to retrieve the value
-	 * @return the attribute value, or {@code null} if not found
+	 * @return the attribute value, or {@code null} if not found unless the attribute
+	 * value cannot be retrieved due to an {@link AnnotationConfigurationException},
+	 * in which case such an exception will be rethrown
 	 * @see #getValue(Annotation, String)
 	 */
+	@Nullable
 	public static Object getValue(Annotation annotation) {
 		return getValue(annotation, VALUE);
 	}
@@ -950,10 +1040,13 @@ public abstract class AnnotationUtils {
 	 * Retrieve the <em>value</em> of a named attribute, given an annotation instance.
 	 * @param annotation the annotation instance from which to retrieve the value
 	 * @param attributeName the name of the attribute value to retrieve
-	 * @return the attribute value, or {@code null} if not found
+	 * @return the attribute value, or {@code null} if not found unless the attribute
+	 * value cannot be retrieved due to an {@link AnnotationConfigurationException},
+	 * in which case such an exception will be rethrown
 	 * @see #getValue(Annotation)
 	 */
-	public static Object getValue(Annotation annotation, String attributeName) {
+	@Nullable
+	public static Object getValue(@Nullable Annotation annotation, @Nullable String attributeName) {
 		if (annotation == null || !StringUtils.hasText(attributeName)) {
 			return null;
 		}
@@ -962,8 +1055,62 @@ public abstract class AnnotationUtils {
 			ReflectionUtils.makeAccessible(method);
 			return method.invoke(annotation);
 		}
-		catch (Exception ex) {
+		catch (NoSuchMethodException ex) {
 			return null;
+		}
+		catch (InvocationTargetException ex) {
+			rethrowAnnotationConfigurationException(ex.getTargetException());
+			throw new IllegalStateException("Could not obtain value for annotation attribute '" +
+					attributeName + "' in " + annotation, ex);
+		}
+		catch (Throwable ex) {
+			handleIntrospectionFailure(annotation.getClass(), ex);
+			return null;
+		}
+	}
+
+	/**
+	 * If the supplied throwable is an {@link AnnotationConfigurationException},
+	 * it will be cast to an {@code AnnotationConfigurationException} and thrown,
+	 * allowing it to propagate to the caller.
+	 * <p>Otherwise, this method does nothing.
+	 * @param ex the throwable to inspect
+	 */
+	static void rethrowAnnotationConfigurationException(Throwable ex) {
+		if (ex instanceof AnnotationConfigurationException) {
+			throw (AnnotationConfigurationException) ex;
+		}
+	}
+
+	/**
+	 * Handle the supplied annotation introspection exception.
+	 * <p>If the supplied exception is an {@link AnnotationConfigurationException},
+	 * it will simply be thrown, allowing it to propagate to the caller, and
+	 * nothing will be logged.
+	 * <p>Otherwise, this method logs an introspection failure (in particular for
+	 * a {@link TypeNotPresentException}) before moving on, assuming nested
+	 * {@code Class} values were not resolvable within annotation attributes and
+	 * thereby effectively pretending there were no annotations on the specified
+	 * element.
+	 * @param element the element that we tried to introspect annotations on
+	 * @param ex the exception that we encountered
+	 * @see #rethrowAnnotationConfigurationException
+	 * @see IntrospectionFailureLogger
+	 */
+	static void handleIntrospectionFailure(@Nullable AnnotatedElement element, Throwable ex) {
+		rethrowAnnotationConfigurationException(ex);
+		IntrospectionFailureLogger logger = IntrospectionFailureLogger.INFO;
+		boolean meta = false;
+		if (element instanceof Class && Annotation.class.isAssignableFrom((Class<?>) element)) {
+			// Meta-annotation or (default) value lookup on an annotation type
+			logger = IntrospectionFailureLogger.DEBUG;
+			meta = true;
+		}
+		if (logger.isEnabled()) {
+			String message = meta ?
+					"Failed to meta-introspect annotation " :
+					"Failed to introspect annotations on ";
+			logger.log(message + element + ": " + ex);
 		}
 	}
 
@@ -974,6 +1121,7 @@ public abstract class AnnotationUtils {
 	 * @return the default value, or {@code null} if not found
 	 * @see #getDefaultValue(Annotation, String)
 	 */
+	@Nullable
 	public static Object getDefaultValue(Annotation annotation) {
 		return getDefaultValue(annotation, VALUE);
 	}
@@ -985,11 +1133,9 @@ public abstract class AnnotationUtils {
 	 * @return the default value of the named attribute, or {@code null} if not found
 	 * @see #getDefaultValue(Class, String)
 	 */
-	public static Object getDefaultValue(Annotation annotation, String attributeName) {
-		if (annotation == null) {
-			return null;
-		}
-		return getDefaultValue(annotation.annotationType(), attributeName);
+	@Nullable
+	public static Object getDefaultValue(@Nullable Annotation annotation, @Nullable String attributeName) {
+		return (annotation != null ? getDefaultValue(annotation.annotationType(), attributeName) : null);
 	}
 
 	/**
@@ -999,6 +1145,7 @@ public abstract class AnnotationUtils {
 	 * @return the default value, or {@code null} if not found
 	 * @see #getDefaultValue(Class, String)
 	 */
+	@Nullable
 	public static Object getDefaultValue(Class<? extends Annotation> annotationType) {
 		return getDefaultValue(annotationType, VALUE);
 	}
@@ -1011,43 +1158,21 @@ public abstract class AnnotationUtils {
 	 * @return the default value of the named attribute, or {@code null} if not found
 	 * @see #getDefaultValue(Annotation, String)
 	 */
-	public static Object getDefaultValue(Class<? extends Annotation> annotationType, String attributeName) {
+	@Nullable
+	public static Object getDefaultValue(
+			@Nullable Class<? extends Annotation> annotationType, @Nullable String attributeName) {
+
 		if (annotationType == null || !StringUtils.hasText(attributeName)) {
 			return null;
 		}
-		try {
-			return annotationType.getDeclaredMethod(attributeName).getDefaultValue();
-		}
-		catch (Exception ex) {
-			return null;
-		}
+		return MergedAnnotation.of(annotationType).getDefaultValue(attributeName).orElse(null);
 	}
 
 	/**
-	 * <em>Synthesize</em> the supplied {@code annotation} by wrapping it in
-	 * a dynamic proxy that transparently enforces <em>attribute alias</em>
-	 * semantics for annotation attributes that are annotated with
-	 * {@link AliasFor @AliasFor}.
-	 *
-	 * @param annotation the annotation to synthesize
-	 * @return the synthesized annotation, if the supplied annotation is
-	 * <em>synthesizable</em>; {@code null} if the supplied annotation is
-	 * {@code null}; otherwise, the supplied annotation unmodified
-	 * @throws AnnotationConfigurationException if invalid configuration of
-	 * {@code @AliasFor} is detected
-	 * @since 4.2
-	 * @see #synthesizeAnnotation(Annotation, AnnotatedElement)
-	 */
-	static <A extends Annotation> A synthesizeAnnotation(A annotation) {
-		return synthesizeAnnotation(annotation, null);
-	}
-
-	/**
-	 * <em>Synthesize</em> the supplied {@code annotation} by wrapping it in
-	 * a dynamic proxy that transparently enforces <em>attribute alias</em>
-	 * semantics for annotation attributes that are annotated with
-	 * {@link AliasFor @AliasFor}.
-	 *
+	 * <em>Synthesize</em> an annotation from the supplied {@code annotation}
+	 * by wrapping it in a dynamic proxy that transparently enforces
+	 * <em>attribute alias</em> semantics for annotation attributes that are
+	 * annotated with {@link AliasFor @AliasFor}.
 	 * @param annotation the annotation to synthesize
 	 * @param annotatedElement the element that is annotated with the supplied
 	 * annotation; may be {@code null} if unknown
@@ -1058,76 +1183,82 @@ public abstract class AnnotationUtils {
 	 * {@code @AliasFor} is detected
 	 * @since 4.2
 	 * @see #synthesizeAnnotation(Map, Class, AnnotatedElement)
+	 * @see #synthesizeAnnotation(Class)
 	 */
-	@SuppressWarnings("unchecked")
-	public static <A extends Annotation> A synthesizeAnnotation(A annotation, AnnotatedElement annotatedElement) {
-		if (annotation == null) {
-			return null;
-		}
-		if (annotation instanceof SynthesizedAnnotation) {
+	public static <A extends Annotation> A synthesizeAnnotation(
+			A annotation, @Nullable AnnotatedElement annotatedElement) {
+
+		if (annotation instanceof SynthesizedAnnotation || AnnotationFilter.PLAIN.matches(annotation)) {
 			return annotation;
 		}
-
-		Class<? extends Annotation> annotationType = annotation.annotationType();
-		if (!isSynthesizable(annotationType)) {
-			return annotation;
-		}
-
-		AnnotationAttributeExtractor attributeExtractor = new DefaultAnnotationAttributeExtractor(annotation,
-			annotatedElement);
-		InvocationHandler handler = new SynthesizedAnnotationInvocationHandler(attributeExtractor);
-		A synthesizedAnnotation = (A) Proxy.newProxyInstance(ClassUtils.getDefaultClassLoader(), new Class<?>[] {
-			(Class<A>) annotationType, SynthesizedAnnotation.class }, handler);
-
-		return synthesizedAnnotation;
+		return MergedAnnotation.from(annotatedElement, annotation).synthesize();
 	}
 
 	/**
-	 * <em>Synthesize</em> the supplied map of annotation attributes by
-	 * wrapping it in a dynamic proxy that implements an annotation of type
-	 * {@code annotationType} and transparently enforces <em>attribute alias</em>
-	 * semantics for annotation attributes that are annotated with
-	 * {@link AliasFor @AliasFor}.
-	 * <p>The supplied map must contain key-value pairs for every attribute
-	 * defined by the supplied {@code annotationType}.
-	 * <p>Note that {@link AnnotationAttributes} is a specialized type of
-	 * {@link Map} that is a suitable candidate for this method's
-	 * {@code attributes} argument.
-	 *
-	 * @param attributes the map of annotation attributes to synthesize
-	 * @param annotationType the type of annotation to synthesize; never {@code null}
-	 * @param annotatedElement the element that is annotated with the annotation
-	 * corresponding to the supplied attributes; may be {@code null} if unknown
-	 * @return the synthesized annotation, or {@code null} if the supplied attributes
-	 * map is {@code null}
-	 * @throws AnnotationConfigurationException if invalid configuration is detected
+	 * <em>Synthesize</em> an annotation from its default attributes values.
+	 * <p>This method simply delegates to
+	 * {@link #synthesizeAnnotation(Map, Class, AnnotatedElement)},
+	 * supplying an empty map for the source attribute values and {@code null}
+	 * for the {@link AnnotatedElement}.
+	 * @param annotationType the type of annotation to synthesize
+	 * @return the synthesized annotation
+	 * @throws IllegalArgumentException if a required attribute is missing
+	 * @throws AnnotationConfigurationException if invalid configuration of
+	 * {@code @AliasFor} is detected
 	 * @since 4.2
+	 * @see #synthesizeAnnotation(Map, Class, AnnotatedElement)
 	 * @see #synthesizeAnnotation(Annotation, AnnotatedElement)
 	 */
-	@SuppressWarnings("unchecked")
-	public static <A extends Annotation> A synthesizeAnnotation(Map<String, Object> attributes,
-			Class<A> annotationType, AnnotatedElement annotatedElement) {
-		Assert.notNull(annotationType, "annotationType must not be null");
-
-		if (attributes == null) {
-			return null;
-		}
-
-		AnnotationAttributeExtractor attributeExtractor = new MapAnnotationAttributeExtractor(attributes,
-			annotationType, annotatedElement);
-		InvocationHandler handler = new SynthesizedAnnotationInvocationHandler(attributeExtractor);
-		A synthesizedAnnotation = (A) Proxy.newProxyInstance(ClassUtils.getDefaultClassLoader(), new Class<?>[] {
-			annotationType, SynthesizedAnnotation.class }, handler);
-
-		return synthesizedAnnotation;
+	public static <A extends Annotation> A synthesizeAnnotation(Class<A> annotationType) {
+		return synthesizeAnnotation(Collections.emptyMap(), annotationType, null);
 	}
 
 	/**
-	 * <em>Synthesize</em> the supplied array of {@code annotations} by
-	 * creating a new array of the same size and type and populating it
-	 * with {@linkplain #synthesizeAnnotation(Annotation) synthesized}
-	 * versions of the annotations from the input array.
-	 *
+	 * <em>Synthesize</em> an annotation from the supplied map of annotation
+	 * attributes by wrapping the map in a dynamic proxy that implements an
+	 * annotation of the specified {@code annotationType} and transparently
+	 * enforces <em>attribute alias</em> semantics for annotation attributes
+	 * that are annotated with {@link AliasFor @AliasFor}.
+	 * <p>The supplied map must contain a key-value pair for every attribute
+	 * defined in the supplied {@code annotationType} that is not aliased or
+	 * does not have a default value. Nested maps and nested arrays of maps
+	 * will be recursively synthesized into nested annotations or nested
+	 * arrays of annotations, respectively.
+	 * <p>Note that {@link AnnotationAttributes} is a specialized type of
+	 * {@link Map} that is an ideal candidate for this method's
+	 * {@code attributes} argument.
+	 * @param attributes the map of annotation attributes to synthesize
+	 * @param annotationType the type of annotation to synthesize
+	 * @param annotatedElement the element that is annotated with the annotation
+	 * corresponding to the supplied attributes; may be {@code null} if unknown
+	 * @return the synthesized annotation
+	 * @throws IllegalArgumentException if a required attribute is missing or if an
+	 * attribute is not of the correct type
+	 * @throws AnnotationConfigurationException if invalid configuration of
+	 * {@code @AliasFor} is detected
+	 * @since 4.2
+	 * @see #synthesizeAnnotation(Annotation, AnnotatedElement)
+	 * @see #synthesizeAnnotation(Class)
+	 * @see #getAnnotationAttributes(AnnotatedElement, Annotation)
+	 * @see #getAnnotationAttributes(AnnotatedElement, Annotation, boolean, boolean)
+	 */
+	public static <A extends Annotation> A synthesizeAnnotation(Map<String, Object> attributes,
+			Class<A> annotationType, @Nullable AnnotatedElement annotatedElement) {
+
+		try {
+			return MergedAnnotation.of(annotatedElement, annotationType, attributes).synthesize();
+		}
+		catch (NoSuchElementException | IllegalStateException ex) {
+			throw new IllegalArgumentException(ex);
+		}
+	}
+
+	/**
+	 * <em>Synthesize</em> an array of annotations from the supplied array
+	 * of {@code annotations} by creating a new array of the same size and
+	 * type and populating it with {@linkplain #synthesizeAnnotation(Annotation,
+	 * AnnotatedElement) synthesized} versions of the annotations from the input
+	 * array.
 	 * @param annotations the array of annotations to synthesize
 	 * @param annotatedElement the element that is annotated with the supplied
 	 * array of annotations; may be {@code null} if unknown
@@ -1139,12 +1270,12 @@ public abstract class AnnotationUtils {
 	 * @see #synthesizeAnnotation(Annotation, AnnotatedElement)
 	 * @see #synthesizeAnnotation(Map, Class, AnnotatedElement)
 	 */
-	public static Annotation[] synthesizeAnnotationArray(Annotation[] annotations, AnnotatedElement annotatedElement) {
-		if (annotations == null) {
-			return null;
+	static Annotation[] synthesizeAnnotationArray(Annotation[] annotations, AnnotatedElement annotatedElement) {
+		if (AnnotationsScanner.hasPlainJavaAnnotationsOnly(annotatedElement)) {
+			return annotations;
 		}
-
-		Annotation[] synthesized = (Annotation[]) Array.newInstance(annotations.getClass().getComponentType(), annotations.length);
+		Annotation[] synthesized = (Annotation[]) Array.newInstance(
+				annotations.getClass().getComponentType(), annotations.length);
 		for (int i = 0; i < annotations.length; i++) {
 			synthesized[i] = synthesizeAnnotation(annotations[i], annotatedElement);
 		}
@@ -1152,507 +1283,29 @@ public abstract class AnnotationUtils {
 	}
 
 	/**
-	 * Get a map of all attribute alias pairs, declared via {@code @AliasFor}
-	 * in the supplied annotation type.
-	 *
-	 * <p>The map is keyed by attribute name with each value representing
-	 * the name of the aliased attribute. For each entry {@code [x, y]} in
-	 * the map there will be a corresponding {@code [y, x]} entry in the map.
-	 *
-	 * <p>An empty return value implies that the annotation does not declare
-	 * any attribute aliases.
-	 *
-	 * @param annotationType the annotation type to find attribute aliases in
-	 * @return a map containing attribute alias pairs; never {@code null}
-	 * @since 4.2
+	 * Clear the internal annotation metadata cache.
+	 * @since 4.3.15
 	 */
-	static Map<String, String> getAttributeAliasMap(Class<? extends Annotation> annotationType) {
-		if (annotationType == null) {
-			return Collections.emptyMap();
-		}
-
-		Map<String, String> map = attributeAliasesCache.get(annotationType);
-		if (map != null) {
-			return map;
-		}
-
-		map = new HashMap<String, String>();
-		for (Method attribute : getAttributeMethods(annotationType)) {
-			String attributeName = attribute.getName();
-			String aliasedAttributeName = getAliasedAttributeName(attribute);
-			if (aliasedAttributeName != null) {
-				map.put(attributeName, aliasedAttributeName);
-			}
-		}
-
-		attributeAliasesCache.put(annotationType, map);
-
-		return map;
-	}
-
-	/**
-	 * Determine if annotations of the supplied {@code annotationType} are
-	 * <em>synthesizable</em> (i.e., in need of being wrapped in a dynamic
-	 * proxy that provides functionality above that of a standard JDK
-	 * annotation).
-	 *
-	 * <p>Specifically, an annotation is <em>synthesizable</em> if it declares
-	 * any attributes that are configured as <em>aliased pairs</em> via
-	 * {@link AliasFor @AliasFor} or if any nested annotations used by the
-	 * annotation declare such <em>aliased pairs</em>.
-	 *
-	 * @since 4.2
-	 * @see SynthesizedAnnotation
-	 * @see SynthesizedAnnotationInvocationHandler
-	 */
-	@SuppressWarnings("unchecked")
-	private static boolean isSynthesizable(Class<? extends Annotation> annotationType) {
-
-		Boolean synthesizable = synthesizableCache.get(annotationType);
-		if (synthesizable != null) {
-			return synthesizable.booleanValue();
-		}
-
-		synthesizable = Boolean.FALSE;
-
-		for (Method attribute : getAttributeMethods(annotationType)) {
-			if (getAliasedAttributeName(attribute) != null) {
-				synthesizable = Boolean.TRUE;
-				break;
-			}
-
-			Class<?> returnType = attribute.getReturnType();
-
-			if (Annotation[].class.isAssignableFrom(returnType)) {
-				Class<? extends Annotation> nestedAnnotationType = (Class<? extends Annotation>) returnType.getComponentType();
-				if (isSynthesizable(nestedAnnotationType)) {
-					synthesizable = Boolean.TRUE;
-					break;
-				}
-			}
-			else if (Annotation.class.isAssignableFrom(returnType)) {
-				Class<? extends Annotation> nestedAnnotationType = (Class<? extends Annotation>) returnType;
-				if (isSynthesizable(nestedAnnotationType)) {
-					synthesizable = Boolean.TRUE;
-					break;
-				}
-			}
-		}
-
-		synthesizableCache.put(annotationType, synthesizable);
-
-		return synthesizable.booleanValue();
-	}
-
-	/**
-	 * Get the name of the aliased attribute configured via
-	 * {@link AliasFor @AliasFor} on the supplied annotation {@code attribute}.
-	 *
-	 * <p>This method does not resolve aliases in other annotations. In
-	 * other words, if {@code @AliasFor} is present on the supplied
-	 * {@code attribute} but {@linkplain AliasFor#annotation references an
-	 * annotation} other than {@link Annotation}, this method will return
-	 * {@code null} immediately.
-	 *
-	 * @param attribute the attribute to find an alias for
-	 * @return the name of the aliased attribute, or {@code null} if not found
-	 * @throws IllegalArgumentException if the supplied attribute method is
-	 * not from an annotation, or if the supplied target type is {@link Annotation}
-	 * @throws AnnotationConfigurationException if invalid configuration of
-	 * {@code @AliasFor} is detected
-	 * @since 4.2
-	 * @see #getAliasedAttributeName(Method, Class)
-	 */
-	static String getAliasedAttributeName(Method attribute) {
-		return getAliasedAttributeName(attribute, null);
-	}
-
-	/**
-	 * Get the name of the aliased attribute configured via
-	 * {@link AliasFor @AliasFor} on the supplied annotation {@code attribute}.
-	 *
-	 * @param attribute the attribute to find an alias for
-	 * @param targetAnnotationType the type of annotation in which the
-	 * aliased attribute is allowed to be declared; {@code null} implies
-	 * <em>within the same annotation</em>
-	 * @return the name of the aliased attribute, or {@code null} if not found
-	 * @throws IllegalArgumentException if the supplied attribute method is
-	 * not from an annotation, or if the supplied target type is {@link Annotation}
-	 * @throws AnnotationConfigurationException if invalid configuration of
-	 * {@code @AliasFor} is detected
-	 * @since 4.2
-	 */
-	@SuppressWarnings("unchecked")
-	static String getAliasedAttributeName(Method attribute, Class<? extends Annotation> targetAnnotationType) {
-		Class<?> declaringClass = attribute.getDeclaringClass();
-		Assert.isTrue(declaringClass.isAnnotation(), "attribute method must be from an annotation");
-		Assert.isTrue(!Annotation.class.equals(targetAnnotationType),
-			"targetAnnotationType must not be java.lang.annotation.Annotation");
-
-		AliasFor aliasFor = attribute.getAnnotation(AliasFor.class);
-
-		// Nothing to check
-		if (aliasFor == null) {
-			return null;
-		}
-
-		Class<? extends Annotation> sourceAnnotationType = (Class<? extends Annotation>) declaringClass;
-		Class<? extends Annotation> aliasedAnnotationType = aliasFor.annotation();
-
-		boolean searchWithinSameAnnotation = (targetAnnotationType == null);
-		boolean sameTargetDeclared = (sourceAnnotationType.equals(aliasedAnnotationType) || Annotation.class.equals(aliasedAnnotationType));
-
-		// Wrong search scope?
-		if (searchWithinSameAnnotation && !sameTargetDeclared) {
-			return null;
-		}
-
-		String attributeName = attribute.getName();
-		String aliasedAttributeName = aliasFor.attribute();
-
-		if (!StringUtils.hasText(aliasedAttributeName)) {
-			String msg = String.format(
-				"@AliasFor declaration on attribute [%s] in annotation [%s] is missing required 'attribute' value.",
-				attributeName, sourceAnnotationType.getName());
-			throw new AnnotationConfigurationException(msg);
-		}
-
-		if (sameTargetDeclared) {
-			aliasedAnnotationType = sourceAnnotationType;
-		}
-
-		Method aliasedAttribute = null;
-		try {
-			aliasedAttribute = aliasedAnnotationType.getDeclaredMethod(aliasedAttributeName);
-		}
-		catch (NoSuchMethodException e) {
-			String msg = String.format(
-				"Attribute [%s] in annotation [%s] is declared as an @AliasFor nonexistent attribute [%s] in annotation [%s].",
-				attributeName, sourceAnnotationType.getName(), aliasedAttributeName, aliasedAnnotationType.getName());
-			throw new AnnotationConfigurationException(msg, e);
-		}
-
-		if (sameTargetDeclared) {
-			AliasFor mirrorAliasFor = aliasedAttribute.getAnnotation(AliasFor.class);
-			if (mirrorAliasFor == null) {
-				String msg = String.format("Attribute [%s] in annotation [%s] must be declared as an @AliasFor [%s].",
-					aliasedAttributeName, sourceAnnotationType.getName(), attributeName);
-				throw new AnnotationConfigurationException(msg);
-			}
-
-			String mirrorAliasedAttributeName = mirrorAliasFor.attribute();
-			if (!attributeName.equals(mirrorAliasedAttributeName)) {
-				String msg = String.format(
-					"Attribute [%s] in annotation [%s] must be declared as an @AliasFor [%s], not [%s].",
-					aliasedAttributeName, sourceAnnotationType.getName(), attributeName, mirrorAliasedAttributeName);
-				throw new AnnotationConfigurationException(msg);
-			}
-		}
-
-		Class<?> returnType = attribute.getReturnType();
-		Class<?> aliasedReturnType = aliasedAttribute.getReturnType();
-		if (!returnType.equals(aliasedReturnType)) {
-			String msg = String.format("Misconfigured aliases: attribute [%s] in annotation [%s] "
-					+ "and attribute [%s] in annotation [%s] must declare the same return type.", attributeName,
-				sourceAnnotationType.getName(), aliasedAttributeName, aliasedAnnotationType.getName());
-			throw new AnnotationConfigurationException(msg);
-		}
-
-		if (sameTargetDeclared) {
-			Object defaultValue = attribute.getDefaultValue();
-			Object aliasedDefaultValue = aliasedAttribute.getDefaultValue();
-
-			if ((defaultValue == null) || (aliasedDefaultValue == null)) {
-				String msg = String.format("Misconfigured aliases: attribute [%s] in annotation [%s] "
-						+ "and attribute [%s] in annotation [%s] must declare default values.", attributeName,
-					sourceAnnotationType.getName(), aliasedAttributeName, aliasedAnnotationType.getName());
-				throw new AnnotationConfigurationException(msg);
-			}
-
-			if (!ObjectUtils.nullSafeEquals(defaultValue, aliasedDefaultValue)) {
-				String msg = String.format("Misconfigured aliases: attribute [%s] in annotation [%s] "
-						+ "and attribute [%s] in annotation [%s] must declare the same default value.", attributeName,
-					sourceAnnotationType.getName(), aliasedAttributeName, aliasedAnnotationType.getName());
-				throw new AnnotationConfigurationException(msg);
-			}
-		}
-
-		return aliasedAttributeName;
-	}
-
-	/**
-	 * Get all methods declared in the supplied {@code annotationType} that
-	 * match Java's requirements for annotation <em>attributes</em>.
-	 *
-	 * <p>All methods in the returned list will be
-	 * {@linkplain ReflectionUtils#makeAccessible(Method) made accessible}.
-	 *
-	 * @param annotationType the type in which to search for attribute methods;
-	 * never {@code null}
-	 * @return all annotation attribute methods in the specified annotation
-	 * type; never {@code null}, though potentially <em>empty</em>
-	 * @since 4.2
-	 */
-	static List<Method> getAttributeMethods(Class<? extends Annotation> annotationType) {
-
-		List<Method> methods = attributeMethodsCache.get(annotationType);
-		if (methods != null) {
-			return methods;
-		}
-
-		methods = new ArrayList<Method>();
-		for (Method method : annotationType.getDeclaredMethods()) {
-			if (isAttributeMethod(method)) {
-				ReflectionUtils.makeAccessible(method);
-				methods.add(method);
-			}
-		}
-
-		attributeMethodsCache.put(annotationType, methods);
-
-		return methods;
-	}
-
-	/**
-	 * Determine if the supplied {@code method} is an annotation attribute method.
-	 * @param method the method to check
-	 * @return {@code true} if the method is an attribute method
-	 */
-	static boolean isAttributeMethod(Method method) {
-		return ((method != null) && (method.getParameterTypes().length == 0) && (method.getReturnType() != void.class));
-	}
-
-	/**
-	 * Determine if the supplied method is an "annotationType" method.
-	 * @return {@code true} if the method is an "annotationType" method
-	 * @see Annotation#annotationType()
-	 */
-	static boolean isAnnotationTypeMethod(Method method) {
-		return ((method != null) && method.getName().equals("annotationType") && (method.getParameterTypes().length == 0));
-	}
-
-	/**
-	 * Post-process the supplied {@link AnnotationAttributes}.
-	 *
-	 * <p>Specifically, this method enforces <em>attribute alias</em> semantics
-	 * for annotation attributes that are annotated with {@link AliasFor @AliasFor}
-	 * and replaces {@linkplain #DEFAULT_VALUE_PLACEHOLDER placeholders} with their
-	 * original default values.
-	 *
-	 * @param element the element that is annotated with an annotation or
-	 * annotation hierarchy from which the supplied attributes were created;
-	 * may be {@code null} if unknown
-	 * @param attributes the annotation attributes to post-process
-	 * @param classValuesAsString whether to convert Class references into Strings (for
-	 * compatibility with {@link org.springframework.core.type.AnnotationMetadata})
-	 * or to preserve them as Class references
-	 * @param nestedAnnotationsAsMap whether to convert nested annotations into
-	 * {@link AnnotationAttributes} maps (for compatibility with
-	 * {@link org.springframework.core.type.AnnotationMetadata}) or to preserve them as
-	 * {@code Annotation} instances
-	 * @since 4.2
-	 * @see #getAnnotationAttributes(AnnotatedElement, Annotation, boolean, boolean, boolean)
-	 * @see #DEFAULT_VALUE_PLACEHOLDER
-	 * @see #getDefaultValue(Class, String)
-	 */
-	static void postProcessAnnotationAttributes(AnnotatedElement element, AnnotationAttributes attributes,
-			boolean classValuesAsString, boolean nestedAnnotationsAsMap) {
-
-		// Abort?
-		if (attributes == null) {
-			return;
-		}
-
-		Class<? extends Annotation> annotationType = attributes.annotationType();
-
-		// Validate @AliasFor configuration
-		Map<String, String> aliasMap = getAttributeAliasMap(annotationType);
-		Set<String> validated = new HashSet<String>();
-		for (String attributeName : aliasMap.keySet()) {
-			String aliasedAttributeName = aliasMap.get(attributeName);
-
-			if (validated.add(attributeName) && validated.add(aliasedAttributeName)) {
-				Object value = attributes.get(attributeName);
-				Object aliasedValue = attributes.get(aliasedAttributeName);
-
-				if (!ObjectUtils.nullSafeEquals(value, aliasedValue) && (value != DEFAULT_VALUE_PLACEHOLDER)
-						&& (aliasedValue != DEFAULT_VALUE_PLACEHOLDER)) {
-					String elementAsString = (element == null ? "unknown element" : element.toString());
-					String msg = String.format(
-						"In AnnotationAttributes for annotation [%s] declared on [%s], attribute [%s] and its alias [%s] are "
-								+ "declared with values of [%s] and [%s], but only one declaration is permitted.",
-						annotationType.getName(), elementAsString, attributeName, aliasedAttributeName,
-						ObjectUtils.nullSafeToString(value), ObjectUtils.nullSafeToString(aliasedValue));
-					throw new AnnotationConfigurationException(msg);
-				}
-
-				// Replace default values with aliased values...
-				if (value == DEFAULT_VALUE_PLACEHOLDER) {
-					attributes.put(attributeName,
-						adaptValue(element, aliasedValue, classValuesAsString, nestedAnnotationsAsMap));
-				}
-				if (aliasedValue == DEFAULT_VALUE_PLACEHOLDER) {
-					attributes.put(aliasedAttributeName,
-						adaptValue(element, value, classValuesAsString, nestedAnnotationsAsMap));
-				}
-			}
-		}
-
-		for (String attributeName : attributes.keySet()) {
-			Object value = attributes.get(attributeName);
-			if (value == DEFAULT_VALUE_PLACEHOLDER) {
-				attributes.put(attributeName,
-					adaptValue(element, getDefaultValue(annotationType, attributeName), classValuesAsString,
-						nestedAnnotationsAsMap));
-			}
-		}
-	}
-
-	/**
-	 * <p>If the supplied throwable is an {@link AnnotationConfigurationException},
-	 * it will be cast to an {@code AnnotationConfigurationException} and thrown,
-	 * allowing it to propagate to the caller.
-	 * <p>Otherwise, this method does nothing.
-	 * @param t the throwable to inspect
-	 * @since 4.2
-	 */
-	static void rethrowAnnotationConfigurationException(Throwable t) {
-		if (t instanceof AnnotationConfigurationException) {
-			throw (AnnotationConfigurationException) t;
-		}
-	}
-
-	/**
-	 * Handle the supplied annotation introspection exception.
-	 * <p>If the supplied exception is an {@link AnnotationConfigurationException},
-	 * it will simply be thrown, allowing it to propagate to the caller, and
-	 * nothing will be logged.
-	 * <p>Otherwise, this method logs an introspection failure (in particular
-	 * {@code TypeNotPresentExceptions}) &mdash; before moving on, pretending
-	 * there were no annotations on this specific element.
-	 * @param element the element that we tried to introspect annotations on
-	 * @param ex the exception that we encountered
-	 * @see #rethrowAnnotationConfigurationException
-	 */
-	static void handleIntrospectionFailure(AnnotatedElement element, Exception ex) {
-
-		rethrowAnnotationConfigurationException(ex);
-
-		Log loggerToUse = logger;
-		if (loggerToUse == null) {
-			loggerToUse = LogFactory.getLog(AnnotationUtils.class);
-			logger = loggerToUse;
-		}
-		if (element instanceof Class && Annotation.class.isAssignableFrom((Class<?>) element)) {
-			// Meta-annotation lookup on an annotation type
-			if (logger.isDebugEnabled()) {
-				logger.debug("Failed to introspect meta-annotations on [" + element + "]: " + ex);
-			}
-		}
-		else {
-			// Direct annotation lookup on regular Class, Method, Field
-			if (loggerToUse.isInfoEnabled()) {
-				logger.info("Failed to introspect annotations on [" + element + "]: " + ex);
-			}
-		}
+	public static void clearCache() {
+		AnnotationTypeMappings.clearCache();
+		AnnotationsScanner.clearCache();
 	}
 
 
 	/**
-	 * Cache key for the AnnotatedElement cache.
+	 * Internal holder used to wrap default values.
 	 */
-	private static class AnnotationCacheKey {
+	private static class DefaultValueHolder {
 
-		private final AnnotatedElement element;
+		final Object defaultValue;
 
-		private final Class<? extends Annotation> annotationType;
-
-		public AnnotationCacheKey(AnnotatedElement element, Class<? extends Annotation> annotationType) {
-			this.element = element;
-			this.annotationType = annotationType;
+		public DefaultValueHolder(Object defaultValue) {
+			this.defaultValue = defaultValue;
 		}
 
 		@Override
-		public boolean equals(Object other) {
-			if (this == other) {
-				return true;
-			}
-			if (!(other instanceof AnnotationCacheKey)) {
-				return false;
-			}
-			AnnotationCacheKey otherKey = (AnnotationCacheKey) other;
-			return (this.element.equals(otherKey.element) &&
-					ObjectUtils.nullSafeEquals(this.annotationType, otherKey.annotationType));
-		}
-
-		@Override
-		public int hashCode() {
-			return (this.element.hashCode() * 29 + this.annotationType.hashCode());
-		}
-	}
-
-
-	private static class AnnotationCollector<A extends Annotation> {
-
-		private final Class<? extends Annotation> containerAnnotationType;
-
-		private final Class<A> annotationType;
-
-		private final Set<AnnotatedElement> visited = new HashSet<AnnotatedElement>();
-
-		private final Set<A> result = new LinkedHashSet<A>();
-
-		public AnnotationCollector(Class<? extends Annotation> containerAnnotationType, Class<A> annotationType) {
-			this.containerAnnotationType = containerAnnotationType;
-			this.annotationType = annotationType;
-		}
-
-		public Set<A> getResult(AnnotatedElement element) {
-			process(element);
-			return Collections.unmodifiableSet(this.result);
-		}
-
-		@SuppressWarnings("unchecked")
-		private void process(AnnotatedElement element) {
-			if (this.visited.add(element)) {
-				try {
-					for (Annotation ann : element.getAnnotations()) {
-						Class<? extends Annotation> currentAnnotationType = ann.annotationType();
-						if (ObjectUtils.nullSafeEquals(this.annotationType, currentAnnotationType)) {
-							this.result.add(synthesizeAnnotation((A) ann, element));
-						}
-						else if (ObjectUtils.nullSafeEquals(this.containerAnnotationType, currentAnnotationType)) {
-							this.result.addAll(getValue(element, ann));
-						}
-						else if (!isInJavaLangAnnotationPackage(ann)) {
-							process(currentAnnotationType);
-						}
-					}
-				}
-				catch (Exception ex) {
-					handleIntrospectionFailure(element, ex);
-				}
-			}
-		}
-
-		@SuppressWarnings("unchecked")
-		private List<A> getValue(AnnotatedElement element, Annotation annotation) {
-			try {
-				Method method = annotation.annotationType().getDeclaredMethod("value");
-				ReflectionUtils.makeAccessible(method);
-				A[] annotations = (A[]) method.invoke(annotation);
-
-				List<A> synthesizedAnnotations = new ArrayList<A>();
-				for (A anno : annotations) {
-					synthesizedAnnotations.add(synthesizeAnnotation(anno, element));
-				}
-				return synthesizedAnnotations;
-			}
-			catch (Exception ex) {
-				rethrowAnnotationConfigurationException(ex);
-				// Unable to read value from repeating annotation container -> ignore it.
-				return Collections.emptyList();
-			}
+		public String toString() {
+			return "*" + this.defaultValue;
 		}
 	}
 

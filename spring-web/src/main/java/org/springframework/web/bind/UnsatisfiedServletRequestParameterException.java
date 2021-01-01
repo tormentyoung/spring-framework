@@ -1,11 +1,11 @@
 /*
- * Copyright 2002-2015 the original author or authors.
+ * Copyright 2002-2018 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,7 +22,6 @@ import java.util.List;
 import java.util.Map;
 
 import org.springframework.util.Assert;
-import org.springframework.util.CollectionUtils;
 import org.springframework.util.ObjectUtils;
 import org.springframework.util.StringUtils;
 
@@ -64,7 +63,7 @@ public class UnsatisfiedServletRequestParameterException extends ServletRequestB
 			Map<String, String[]> actualParams) {
 
 		super("");
-		Assert.isTrue(!CollectionUtils.isEmpty(paramConditions));
+		Assert.notEmpty(paramConditions, "Parameter conditions must not be empty");
 		this.paramConditions = paramConditions;
 		this.actualParams = actualParams;
 	}
@@ -88,18 +87,6 @@ public class UnsatisfiedServletRequestParameterException extends ServletRequestB
 		return sb.toString();
 	}
 
-	private static String requestParameterMapToString(Map<String, String[]> actualParams) {
-		StringBuilder result = new StringBuilder();
-		for (Iterator<Map.Entry<String, String[]>> it = actualParams.entrySet().iterator(); it.hasNext();) {
-			Map.Entry<String, String[]> entry = it.next();
-			result.append(entry.getKey()).append('=').append(ObjectUtils.nullSafeToString(entry.getValue()));
-			if (it.hasNext()) {
-				result.append(", ");
-			}
-		}
-		return result.toString();
-	}
-
 	/**
 	 * Return the parameter conditions that have been violated or the first group
 	 * in case of multiple groups.
@@ -111,8 +98,8 @@ public class UnsatisfiedServletRequestParameterException extends ServletRequestB
 
 	/**
 	 * Return all parameter condition groups that have been violated.
-	 * @see org.springframework.web.bind.annotation.RequestMapping#params()
 	 * @since 4.2
+	 * @see org.springframework.web.bind.annotation.RequestMapping#params()
 	 */
 	public final List<String[]> getParamConditionGroups() {
 		return this.paramConditions;
@@ -124,6 +111,19 @@ public class UnsatisfiedServletRequestParameterException extends ServletRequestB
 	 */
 	public final Map<String, String[]> getActualParams() {
 		return this.actualParams;
+	}
+
+
+	private static String requestParameterMapToString(Map<String, String[]> actualParams) {
+		StringBuilder result = new StringBuilder();
+		for (Iterator<Map.Entry<String, String[]>> it = actualParams.entrySet().iterator(); it.hasNext();) {
+			Map.Entry<String, String[]> entry = it.next();
+			result.append(entry.getKey()).append('=').append(ObjectUtils.nullSafeToString(entry.getValue()));
+			if (it.hasNext()) {
+				result.append(", ");
+			}
+		}
+		return result.toString();
 	}
 
 }

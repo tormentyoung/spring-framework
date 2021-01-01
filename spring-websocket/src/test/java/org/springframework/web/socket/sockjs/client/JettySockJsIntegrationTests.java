@@ -1,11 +1,11 @@
 /*
- * Copyright 2002-2014 the original author or authors.
+ * Copyright 2002-2015 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,11 +17,9 @@
 package org.springframework.web.socket.sockjs.client;
 
 import org.eclipse.jetty.client.HttpClient;
-import org.junit.BeforeClass;
+
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.tests.Assume;
-import org.springframework.tests.TestGroup;
 import org.springframework.web.socket.JettyWebSocketTestServer;
 import org.springframework.web.socket.client.jetty.JettyWebSocketClient;
 import org.springframework.web.socket.server.RequestUpgradeStrategy;
@@ -33,11 +31,6 @@ import org.springframework.web.socket.server.jetty.JettyRequestUpgradeStrategy;
  * @author Rossen Stoyanchev
  */
 public class JettySockJsIntegrationTests extends AbstractSockJsIntegrationTests {
-
-	@BeforeClass
-	public static void setUpOnce() throws Exception {
-		Assume.group(TestGroup.PERFORMANCE);
-	}
 
 	@Override
 	protected Class<?> upgradeStrategyConfigClass() {
